@@ -48,14 +48,14 @@
 //! - `NSCalendarsUsageDescription` - for calendar access (older macOS)
 
 use block2::RcBlock;
-use chrono::{DateTime, Duration, Local, TimeZone};
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike};
 use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
 use objc2_event_kit::{
     EKAuthorizationStatus, EKCalendar, EKEntityType, EKEvent, EKEventStore, EKReminder, EKSpan,
 };
-use objc2_foundation::{NSArray, NSDate, NSError, NSString};
+use objc2_foundation::{NSArray, NSCalendar, NSDate, NSDateComponents, NSError, NSString};
 use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
 
@@ -120,6 +120,12 @@ pub struct ReminderItem {
     pub priority: usize,
     /// Calendar/list the reminder belongs to
     pub calendar_title: Option<String>,
+    /// Due date for the reminder
+    pub due_date: Option<DateTime<Local>>,
+    /// Start date (when to start working on it)
+    pub start_date: Option<DateTime<Local>>,
+    /// Completion date (when it was completed)
+    pub completion_date: Option<DateTime<Local>>,
 }
 
 /// Represents a calendar (reminder list)
@@ -353,12 +359,23 @@ impl RemindersManager {
     }
 
     /// Creates a new reminder
+    ///
+    /// # Arguments
+    /// * `title` - The reminder title
+    /// * `notes` - Optional notes/description
+    /// * `calendar_title` - Optional calendar/list name (uses default if None)
+    /// * `priority` - Optional priority (0 = none, 1-4 = high, 5 = medium, 6-9 = low)
+    /// * `due_date` - Optional due date for the reminder
+    /// * `start_date` - Optional start date (when to start working on it)
+    #[allow(clippy::too_many_arguments)]
     pub fn create_reminder(
         &self,
         title: &str,
         notes: Option<&str>,
         calendar_title: Option<&str>,
         priority: Option<usize>,
+        due_date: Option<DateTime<Local>>,
+        start_date: Option<DateTime<Local>>,
     ) -> Result<ReminderItem> {
         self.ensure_authorized()?;
 
@@ -377,6 +394,18 @@ impl RemindersManager {
         // Set priority if provided
         if let Some(p) = priority {
             unsafe { reminder.setPriority(p) };
+        }
+
+        // Set due date if provided
+        if let Some(due) = due_date {
+            let components = datetime_to_date_components(due);
+            unsafe { reminder.setDueDateComponents(Some(&components)) };
+        }
+
+        // Set start date if provided
+        if let Some(start) = start_date {
+            let components = datetime_to_date_components(start);
+            unsafe { reminder.setStartDateComponents(Some(&components)) };
         }
 
         // Set calendar
@@ -399,6 +428,11 @@ impl RemindersManager {
     }
 
     /// Updates an existing reminder
+    ///
+    /// All fields are optional - only provided fields will be updated.
+    /// Pass `Some(None)` for due_date/start_date to clear them.
+    /// Use `calendar_title` to move the reminder to a different list.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_reminder(
         &self,
         identifier: &str,
@@ -406,6 +440,9 @@ impl RemindersManager {
         notes: Option<&str>,
         completed: Option<bool>,
         priority: Option<usize>,
+        due_date: Option<Option<DateTime<Local>>>,
+        start_date: Option<Option<DateTime<Local>>>,
+        calendar_title: Option<&str>,
     ) -> Result<ReminderItem> {
         self.ensure_authorized()?;
 
@@ -429,6 +466,38 @@ impl RemindersManager {
             unsafe { reminder.setPriority(p) };
         }
 
+        // Handle due date: Some(Some(date)) = set, Some(None) = clear, None = no change
+        if let Some(due_opt) = due_date {
+            match due_opt {
+                Some(due) => {
+                    let components = datetime_to_date_components(due);
+                    unsafe { reminder.setDueDateComponents(Some(&components)) };
+                }
+                None => {
+                    unsafe { reminder.setDueDateComponents(None) };
+                }
+            }
+        }
+
+        // Handle start date: Some(Some(date)) = set, Some(None) = clear, None = no change
+        if let Some(start_opt) = start_date {
+            match start_opt {
+                Some(start) => {
+                    let components = datetime_to_date_components(start);
+                    unsafe { reminder.setStartDateComponents(Some(&components)) };
+                }
+                None => {
+                    unsafe { reminder.setStartDateComponents(None) };
+                }
+            }
+        }
+
+        // Move to a different calendar/list if specified
+        if let Some(cal_title) = calendar_title {
+            let calendar = self.find_calendar_by_title(cal_title)?;
+            unsafe { reminder.setCalendar(Some(&calendar)) };
+        }
+
         unsafe {
             self.store
                 .saveReminder_commit_error(&reminder, true)
@@ -440,12 +509,12 @@ impl RemindersManager {
 
     /// Marks a reminder as complete
     pub fn complete_reminder(&self, identifier: &str) -> Result<ReminderItem> {
-        self.update_reminder(identifier, None, None, Some(true), None)
+        self.update_reminder(identifier, None, None, Some(true), None, None, None, None)
     }
 
     /// Marks a reminder as incomplete
     pub fn uncomplete_reminder(&self, identifier: &str) -> Result<ReminderItem> {
-        self.update_reminder(identifier, None, None, Some(false), None)
+        self.update_reminder(identifier, None, None, Some(false), None, None, None, None)
     }
 
     /// Deletes a reminder
@@ -468,6 +537,132 @@ impl RemindersManager {
         self.ensure_authorized()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         Ok(reminder_to_item(&reminder))
+    }
+
+    // ========================================================================
+    // Calendar (Reminder List) Management
+    // ========================================================================
+
+    /// Creates a new reminder list (calendar)
+    ///
+    /// The list will be created in the default source (usually iCloud or Local).
+    pub fn create_calendar(&self, title: &str) -> Result<CalendarInfo> {
+        self.ensure_authorized()?;
+
+        // Create a new calendar for reminders
+        let calendar = unsafe {
+            EKCalendar::calendarForEntityType_eventStore(EKEntityType::Reminder, &self.store)
+        };
+
+        // Set the title
+        let ns_title = NSString::from_str(title);
+        unsafe { calendar.setTitle(&ns_title) };
+
+        // Find a suitable source (prefer iCloud, fall back to local)
+        let source = self.find_best_source_for_reminders()?;
+        unsafe { calendar.setSource(Some(&source)) };
+
+        // Save the calendar
+        unsafe {
+            self.store
+                .saveCalendar_commit_error(&calendar, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+
+        Ok(calendar_to_info(&calendar))
+    }
+
+    /// Renames an existing reminder list (calendar)
+    pub fn rename_calendar(&self, identifier: &str, new_title: &str) -> Result<CalendarInfo> {
+        self.ensure_authorized()?;
+
+        let calendar = self.find_calendar_by_id(identifier)?;
+
+        // Check if modifications are allowed
+        if !unsafe { calendar.allowsContentModifications() } {
+            return Err(EventKitError::SaveFailed(
+                "Calendar does not allow modifications".to_string(),
+            ));
+        }
+
+        // Set new title
+        let ns_title = NSString::from_str(new_title);
+        unsafe { calendar.setTitle(&ns_title) };
+
+        // Save changes
+        unsafe {
+            self.store
+                .saveCalendar_commit_error(&calendar, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+
+        Ok(calendar_to_info(&calendar))
+    }
+
+    /// Deletes a reminder list (calendar)
+    ///
+    /// Warning: This will delete all reminders in the list!
+    pub fn delete_calendar(&self, identifier: &str) -> Result<()> {
+        self.ensure_authorized()?;
+
+        let calendar = self.find_calendar_by_id(identifier)?;
+
+        // Check if modifications are allowed
+        if !unsafe { calendar.allowsContentModifications() } {
+            return Err(EventKitError::DeleteFailed(
+                "Calendar does not allow modifications".to_string(),
+            ));
+        }
+
+        unsafe {
+            self.store
+                .removeCalendar_commit_error(&calendar, true)
+                .map_err(|e| EventKitError::DeleteFailed(format!("{:?}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    /// Gets a calendar by its identifier
+    pub fn get_calendar(&self, identifier: &str) -> Result<CalendarInfo> {
+        self.ensure_authorized()?;
+        let calendar = self.find_calendar_by_id(identifier)?;
+        Ok(calendar_to_info(&calendar))
+    }
+
+    // Helper to find the best source for creating new reminder calendars
+    fn find_best_source_for_reminders(&self) -> Result<Retained<objc2_event_kit::EKSource>> {
+        // Try to get the source from the default calendar first
+        if let Some(default_cal) = unsafe { self.store.defaultCalendarForNewReminders() } {
+            if let Some(source) = unsafe { default_cal.source() } {
+                return Ok(source);
+            }
+        }
+
+        // Fall back to finding any source that supports reminders
+        let sources = unsafe { self.store.sources() };
+        for source in sources.iter() {
+            // Check if this source supports reminder calendars
+            let calendars = unsafe { source.calendarsForEntityType(EKEntityType::Reminder) };
+            if calendars.len() > 0 {
+                return Ok(source.retain());
+            }
+        }
+
+        Err(EventKitError::SaveFailed(
+            "No suitable source found for creating reminder calendar".to_string(),
+        ))
+    }
+
+    // Helper to find a calendar by identifier
+    fn find_calendar_by_id(&self, identifier: &str) -> Result<Retained<EKCalendar>> {
+        let ns_id = NSString::from_str(identifier);
+        let calendar = unsafe { self.store.calendarWithIdentifier(&ns_id) };
+
+        match calendar {
+            Some(cal) => Ok(cal),
+            None => Err(EventKitError::CalendarNotFound(identifier.to_string())),
+        }
     }
 
     // Helper to find a calendar by title
@@ -563,6 +758,18 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
     let priority = unsafe { reminder.priority() };
     let calendar_title = unsafe { reminder.calendar() }.map(|c| unsafe { c.title() }.to_string());
 
+    // Extract due date from dueDateComponents
+    let due_date = unsafe { reminder.dueDateComponents() }
+        .and_then(|components| date_components_to_datetime(&components));
+
+    // Extract start date from startDateComponents
+    let start_date = unsafe { reminder.startDateComponents() }
+        .and_then(|components| date_components_to_datetime(&components));
+
+    // Extract completion date
+    let completion_date =
+        unsafe { reminder.completionDate() }.map(|date| nsdate_to_datetime(&date));
+
     ReminderItem {
         identifier,
         title,
@@ -570,6 +777,9 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
         completed,
         priority,
         calendar_title,
+        due_date,
+        start_date,
+        completion_date,
     }
 }
 
@@ -998,6 +1208,31 @@ fn datetime_to_nsdate(dt: DateTime<Local>) -> Retained<NSDate> {
 fn nsdate_to_datetime(date: &NSDate) -> DateTime<Local> {
     let timestamp = date.timeIntervalSince1970();
     Local.timestamp_opt(timestamp as i64, 0).unwrap()
+}
+
+// Helper to convert NSDateComponents to chrono DateTime
+fn date_components_to_datetime(components: &NSDateComponents) -> Option<DateTime<Local>> {
+    // Get a calendar to convert components to a date
+    let calendar = NSCalendar::currentCalendar();
+
+    // Convert components to NSDate using the calendar
+    let date = calendar.dateFromComponents(components)?;
+
+    Some(nsdate_to_datetime(&date))
+}
+
+// Helper to convert chrono DateTime to NSDateComponents
+fn datetime_to_date_components(dt: DateTime<Local>) -> Retained<NSDateComponents> {
+    let components = NSDateComponents::new();
+
+    components.setYear(dt.year() as isize);
+    components.setMonth(dt.month() as isize);
+    components.setDay(dt.day() as isize);
+    components.setHour(dt.hour() as isize);
+    components.setMinute(dt.minute() as isize);
+    components.setSecond(dt.second() as isize);
+
+    components
 }
 
 #[cfg(test)]

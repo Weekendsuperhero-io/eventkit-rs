@@ -448,7 +448,7 @@ fn cmd_reminders_add(
     }
 
     let manager = RemindersManager::new();
-    let reminder = manager.create_reminder(title, notes, list, priority)?;
+    let reminder = manager.create_reminder(title, notes, list, priority, None, None)?;
 
     println!("✓ Created reminder: {}", reminder.title);
     println!("  ID: {}", reminder.identifier);
@@ -480,7 +480,7 @@ fn cmd_reminders_update(
     }
 
     let manager = RemindersManager::new();
-    let reminder = manager.update_reminder(id, title, notes, None, priority)?;
+    let reminder = manager.update_reminder(id, title, notes, None, priority, None, None, None)?;
 
     println!("✓ Updated reminder: {}", reminder.title);
 
