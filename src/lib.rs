@@ -656,10 +656,10 @@ impl RemindersManager {
     // Helper to find the best source for creating new reminder calendars
     fn find_best_source_for_reminders(&self) -> Result<Retained<objc2_event_kit::EKSource>> {
         // Try to get the source from the default calendar first
-        if let Some(default_cal) = unsafe { self.store.defaultCalendarForNewReminders() } {
-            if let Some(source) = unsafe { default_cal.source() } {
-                return Ok(source);
-            }
+        if let Some(default_cal) = unsafe { self.store.defaultCalendarForNewReminders() }
+            && let Some(source) = unsafe { default_cal.source() }
+        {
+            return Ok(source);
         }
 
         // Fall back to finding any source that supports reminders
@@ -667,7 +667,7 @@ impl RemindersManager {
         for source in sources.iter() {
             // Check if this source supports reminder calendars
             let calendars = unsafe { source.calendarsForEntityType(EKEntityType::Reminder) };
-            if calendars.len() > 0 {
+            if !calendars.is_empty() {
                 return Ok(source.retain());
             }
         }

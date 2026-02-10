@@ -160,6 +160,12 @@ pub struct EventKitServer {
     tool_router: ToolRouter<Self>,
 }
 
+impl Default for EventKitServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Parse a date string in format "YYYY-MM-DD" or "YYYY-MM-DD HH:MM"
 fn parse_datetime(s: &str) -> Result<DateTime<Local>, String> {
     // Try parsing with time first
@@ -300,10 +306,10 @@ impl EventKitServer {
                         output
                             .push_str(&format!("    Start: {}\n", start.format("%Y-%m-%d %H:%M")));
                     }
-                    if let Some(notes) = &reminder.notes {
-                        if !notes.is_empty() {
-                            output.push_str(&format!("    Notes: {}\n", notes));
-                        }
+                    if let Some(notes) = &reminder.notes
+                        && !notes.is_empty()
+                    {
+                        output.push_str(&format!("    Notes: {}\n", notes));
                     }
                 }
                 Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -685,15 +691,15 @@ impl EventKitServer {
                         event.identifier
                     ));
 
-                    if let Some(location) = &event.location {
-                        if !location.is_empty() {
-                            output.push_str(&format!("  Location: {}\n", location));
-                        }
+                    if let Some(location) = &event.location
+                        && !location.is_empty()
+                    {
+                        output.push_str(&format!("  Location: {}\n", location));
                     }
-                    if let Some(notes) = &event.notes {
-                        if !notes.is_empty() {
-                            output.push_str(&format!("  Notes: {}\n", notes));
-                        }
+                    if let Some(notes) = &event.notes
+                        && !notes.is_empty()
+                    {
+                        output.push_str(&format!("  Notes: {}\n", notes));
                     }
                 }
                 Ok(CallToolResult::success(vec![Content::text(output)]))
