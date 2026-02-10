@@ -1,6 +1,6 @@
 [package]
 name = "eventkit-rs"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A Rust library and CLI for managing macOS Calendar events and Reminders via EventKit"
 license = "MIT"
@@ -8,50 +8,67 @@ repository = "https://github.com/weekendsuperhero/eventkit-rs"
 documentation = "https://docs.rs/eventkit-rs"
 homepage = "https://github.com/weekendsuperhero/eventkit-rs"
 readme = "README.md"
-keywords = ["macos", "calendar", "reminders", "eventkit", "apple"]
+keywords = ["apple", "calendar", "eventkit", "macos", "reminders"]
 categories = ["api-bindings", "os::macos-apis"]
 authors = ["WeekendSuperhero <weekend@weekendsuperhero.io>"]
 rust-version = "1.92"
 
-[[bin]]
-name = "eventkit"
-path = "src/main.rs"
+[package.metadata.docs.rs]
+targets = ["x86_64-apple-darwin", "aarch64-apple-darwin"]
 
 [lib]
 name = "eventkit"
 path = "src/lib.rs"
 
+[[bin]]
+name = "eventkit"
+path = "src/main.rs"
+
 [dependencies]
+# MCP server dependencies (optional, gated behind "mcp" feature)
+anyhow = { version = "1", optional = true }
+block2 = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 objc2 = "0.6"
 objc2-event-kit = { version = "0.3.2", features = [
-    "EKEventStore",
-    "EKEvent",
-    "EKReminder",
-    "EKCalendar",
-    "EKCalendarItem",
-    "EKObject",
-    "EKSource",
+  "EKCalendar",
+  "EKCalendarItem",
+  "EKEvent",
+  "EKEventStore",
+  "EKObject",
+  "EKReminder",
+  "EKSource",
 ] }
 objc2-foundation = { version = "0.3.2", features = [
-    "NSString",
-    "NSArray",
-    "NSDate",
-    "NSCalendar",
-    "NSError",
-    "NSPredicate",
+  "NSArray",
+  "NSCalendar",
+  "NSDate",
+  "NSError",
+  "NSPredicate",
+  "NSString",
 ] }
-block2 = "0.6"
-clap = { version = "4", features = ["derive"] }
-chrono = "0.4"
+rmcp = { version = "0", features = ["macros", "server", "transport-io"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 thiserror = "2"
+tokio = { version = "1", features = ["full"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
 # For future tests
 
 [features]
-default = ["reminders", "events"]
-reminders = []
+default = ["events", "mcp", "reminders"]
 events = []
-
-[package.metadata.docs.rs]
-targets = ["x86_64-apple-darwin", "aarch64-apple-darwin"]
+mcp = [
+  "dep:anyhow",
+  "dep:rmcp",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:tokio",
+  "dep:tracing",
+  "dep:tracing-subscriber"
+]
+reminders = []

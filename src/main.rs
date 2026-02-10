@@ -10,8 +10,13 @@ use eventkit::{AuthorizationStatus, EventKitError, EventsManager, RemindersManag
 #[command(name = "eventkit")]
 #[command(author, version, about = "Manage macOS Calendar and Reminders from the command line", long_about = None)]
 struct Cli {
+    /// Run as an MCP (Model Context Protocol) server over stdio
+    #[cfg(feature = "mcp")]
+    #[arg(long)]
+    mcp: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -57,6 +62,10 @@ enum RemindersCommands {
         /// Show all details
         #[arg(short, long)]
         all: bool,
+
+        /// Show all fields for debugging
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Create a new reminder
@@ -205,7 +214,26 @@ enum EventsCommands {
 fn main() {
     let cli = Cli::parse();
 
-    let result = match cli.command {
+    // Handle --mcp flag
+    #[cfg(feature = "mcp")]
+    if cli.mcp {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        if let Err(e) = rt.block_on(eventkit::mcp::run_mcp_server()) {
+            eprintln!("MCP server error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let Some(command) = cli.command else {
+        // No subcommand and no --mcp flag: print help
+        use clap::CommandFactory;
+        Cli::command().print_help().ok();
+        println!();
+        std::process::exit(1);
+    };
+
+    let result = match command {
         Commands::Status { events } => cmd_status(events),
         Commands::Reminders(cmd) => match cmd {
             RemindersCommands::Authorize => cmd_reminders_authorize(),
@@ -215,7 +243,8 @@ fn main() {
                 incomplete,
                 completed,
                 all,
-            } => cmd_reminders_list(list, incomplete, completed, all),
+                debug,
+            } => cmd_reminders_list(list, incomplete, completed, all, debug),
             RemindersCommands::Add {
                 title,
                 notes,
@@ -374,6 +403,7 @@ fn cmd_reminders_list(
     incomplete: bool,
     show_completed: bool,
     show_all: bool,
+    debug: bool,
 ) -> Result<(), EventKitError> {
     let manager = RemindersManager::new();
 
@@ -422,6 +452,79 @@ fn cmd_reminders_list(
                 println!("      List: {}", cal);
             }
             println!("      ID: {}", reminder.identifier);
+        }
+
+        if debug {
+            // Print all available fields for debugging
+            println!("      Completed: {}", reminder.completed);
+            println!("      Priority: {}", reminder.priority);
+
+            if let Some(due_date) = reminder.due_date {
+                println!("      Due Date: {}", due_date.format("%Y-%m-%d %H:%M:%S"));
+            } else {
+                println!("      Due Date: None");
+            }
+
+            if let Some(start_date) = reminder.start_date {
+                println!(
+                    "      Start Date: {}",
+                    start_date.format("%Y-%m-%d %H:%M:%S")
+                );
+            } else {
+                println!("      Start Date: None");
+            }
+
+            if let Some(completion_date) = reminder.completion_date {
+                println!(
+                    "      Completion Date: {}",
+                    completion_date.format("%Y-%m-%d %H:%M:%S")
+                );
+            } else {
+                println!("      Completion Date: None");
+            }
+
+            // Additional inherited fields from EKCalendarItem parent class
+            if let Some(ref notes) = reminder.notes {
+                println!("      Notes: {}", notes);
+            }
+            println!("      Has Notes: {}", reminder.has_notes);
+            if let Some(ref cal) = reminder.calendar_title {
+                println!("      Calendar/List: {}", cal);
+            }
+            if let Some(ref ext_id) = reminder.external_identifier {
+                println!("      External ID: {}", ext_id);
+            }
+            if let Some(ref location) = reminder.location {
+                println!("      Location: {}", location);
+            }
+            if let Some(ref url) = reminder.url {
+                println!("      URL: {}", url);
+            }
+            if let Some(creation_date) = reminder.creation_date {
+                println!(
+                    "      Creation Date: {}",
+                    creation_date.format("%Y-%m-%d %H:%M:%S")
+                );
+            } else {
+                println!("      Creation Date: None");
+            }
+            if let Some(last_modified_date) = reminder.last_modified_date {
+                println!(
+                    "      Last Modified Date: {}",
+                    last_modified_date.format("%Y-%m-%d %H:%M:%S")
+                );
+            } else {
+                println!("      Last Modified Date: None");
+            }
+            if let Some(ref timezone) = reminder.timezone {
+                println!("      Timezone: {}", timezone);
+            }
+            println!("      Has Alarms: {}", reminder.has_alarms);
+            println!(
+                "      Has Recurrence Rules: {}",
+                reminder.has_recurrence_rules
+            );
+            println!("      Has Attendees: {}", reminder.has_attendees);
         }
     }
 

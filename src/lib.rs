@@ -59,6 +59,9 @@ use objc2_foundation::{NSArray, NSCalendar, NSDate, NSDateComponents, NSError, N
 use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 /// Errors that can occur when working with EventKit
 #[derive(Error, Debug)]
 pub enum EventKitError {
@@ -126,6 +129,26 @@ pub struct ReminderItem {
     pub start_date: Option<DateTime<Local>>,
     /// Completion date (when it was completed)
     pub completion_date: Option<DateTime<Local>>,
+    /// External identifier for the reminder (server-provided)
+    pub external_identifier: Option<String>,
+    /// Location associated with the reminder
+    pub location: Option<String>,
+    /// URL associated with the reminder
+    pub url: Option<String>,
+    /// Creation date of the reminder
+    pub creation_date: Option<DateTime<Local>>,
+    /// Last modified date of the reminder
+    pub last_modified_date: Option<DateTime<Local>>,
+    /// Timezone of the reminder
+    pub timezone: Option<String>,
+    /// Whether the reminder has alarms
+    pub has_alarms: bool,
+    /// Whether the reminder has recurrence rules
+    pub has_recurrence_rules: bool,
+    /// Whether the reminder has attendees
+    pub has_attendees: bool,
+    /// Whether the reminder has notes
+    pub has_notes: bool,
 }
 
 /// Represents a calendar (reminder list)
@@ -770,6 +793,23 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
     let completion_date =
         unsafe { reminder.completionDate() }.map(|date| nsdate_to_datetime(&date));
 
+    // Extract additional fields from EKCalendarItem parent class
+    let external_identifier =
+        unsafe { reminder.calendarItemExternalIdentifier() }.map(|id| id.to_string());
+    let location = unsafe { reminder.location() }.map(|loc| loc.to_string());
+    let url = unsafe { reminder.URL() }
+        .as_ref()
+        .and_then(|url_ref| url_ref.absoluteString())
+        .map(|abs_str| abs_str.to_string());
+    let creation_date = unsafe { reminder.creationDate() }.map(|date| nsdate_to_datetime(&date));
+    let last_modified_date =
+        unsafe { reminder.lastModifiedDate() }.map(|date| nsdate_to_datetime(&date));
+    let timezone = unsafe { reminder.timeZone() }.map(|tz| tz.name().to_string());
+    let has_alarms = unsafe { reminder.hasAlarms() };
+    let has_recurrence_rules = unsafe { reminder.hasRecurrenceRules() };
+    let has_attendees = unsafe { reminder.hasAttendees() };
+    let has_notes = unsafe { reminder.hasNotes() };
+
     ReminderItem {
         identifier,
         title,
@@ -780,6 +820,16 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
         due_date,
         start_date,
         completion_date,
+        external_identifier,
+        location,
+        url,
+        creation_date,
+        last_modified_date,
+        timezone,
+        has_alarms,
+        has_recurrence_rules,
+        has_attendees,
+        has_notes,
     }
 }
 
@@ -1060,7 +1110,7 @@ impl EventsManager {
         // Save
         unsafe {
             self.store
-                .saveEvent_span_error(&event, EKSpan::ThisEvent)
+                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
                 .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
         }
 
@@ -1108,7 +1158,7 @@ impl EventsManager {
 
         unsafe {
             self.store
-                .saveEvent_span_error(&event, EKSpan::ThisEvent)
+                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
                 .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
         }
 
@@ -1123,7 +1173,7 @@ impl EventsManager {
 
         unsafe {
             self.store
-                .removeEvent_span_error(&event, EKSpan::ThisEvent)
+                .removeEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
                 .map_err(|e| EventKitError::DeleteFailed(format!("{:?}", e)))?;
         }
 
