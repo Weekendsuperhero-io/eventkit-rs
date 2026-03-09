@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["apple", "calendar", "eventkit", "macos", "reminders"]
 categories = ["api-bindings", "os::macos-apis"]
 authors = ["WeekendSuperhero <weekend@weekendsuperhero.io>"]
-rust-version = "1.92"
+rust-version = "1.94"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-apple-darwin", "aarch64-apple-darwin"]
@@ -39,6 +39,8 @@ objc2-event-kit = { version = "0.3.2", features = [
   "EKObject",
   "EKReminder",
   "EKSource",
+  "EKTypes",
+  "block2",
 ] }
 objc2-foundation = { version = "0.3.2", features = [
   "NSArray",
@@ -47,8 +49,10 @@ objc2-foundation = { version = "0.3.2", features = [
   "NSError",
   "NSPredicate",
   "NSString",
+  "NSTimeZone",
+  "NSURL",
 ] }
-rmcp = { version = "0", features = ["macros", "server", "transport-io"], optional = true }
+rmcp = { version = "1", features = ["macros", "server", "transport-io"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 thiserror = "2"

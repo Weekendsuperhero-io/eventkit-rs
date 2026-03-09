@@ -6,11 +6,15 @@
 //! This module is gated behind the `mcp` feature flag.
 
 use rmcp::{
-    ErrorData as McpError, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    ErrorData as McpError, RoleServer, ServiceExt,
+    handler::server::{
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        wrapper::Parameters,
+    },
     model::*,
-    schemars,
+    prompt, prompt_handler, prompt_router, schemars,
     schemars::JsonSchema,
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -142,11 +146,41 @@ pub struct EventIdRequest {
     pub event_id: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
-pub struct NoArgs {
-    /// Ignored. Exists to make some MCP callers send `{}` instead of an empty string.
+// ============================================================================
+// Prompt Argument Types
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListRemindersPromptArgs {
+    /// Name of the reminder list to show. If not provided, shows all lists.
     #[serde(default)]
-    pub _ignored: bool,
+    pub list_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MoveReminderPromptArgs {
+    /// The unique identifier of the reminder to move
+    pub reminder_id: String,
+    /// The name of the destination reminder list
+    pub destination_list: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CreateReminderPromptArgs {
+    /// Title of the reminder
+    pub title: String,
+    /// Detailed notes/context for the reminder
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Name of the reminder list to add to
+    #[serde(default)]
+    pub list_name: Option<String>,
+    /// Priority (0 = none, 1-4 = high, 5 = medium, 6-9 = low)
+    #[serde(default)]
+    pub priority: Option<u8>,
+    /// Due date in format "YYYY-MM-DD" or "YYYY-MM-DD HH:MM"
+    #[serde(default)]
+    pub due_date: Option<String>,
 }
 
 // ============================================================================
@@ -158,6 +192,9 @@ pub struct NoArgs {
 #[derive(Clone)]
 pub struct EventKitServer {
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
+    /// Limits concurrent EventKit access to 1 at a time, since EventKit is !Send+!Sync
+    concurrency: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for EventKitServer {
@@ -195,6 +232,8 @@ impl EventKitServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
+            concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -202,30 +241,9 @@ impl EventKitServer {
     // Reminders Tools
     // ========================================================================
 
-    #[tool(
-        description = "Request authorization to access macOS Reminders. Must be called before using other reminder tools."
-    )]
-    async fn reminders_authorize(
-        &self,
-        Parameters(_): Parameters<NoArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let manager = RemindersManager::new();
-        match manager.request_access() {
-            Ok(_) => Ok(CallToolResult::success(vec![Content::text(
-                "Successfully authorized access to Reminders.",
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error: {}",
-                e
-            ))])),
-        }
-    }
-
     #[tool(description = "List all reminder lists (calendars) available in macOS Reminders.")]
-    async fn list_reminder_lists(
-        &self,
-        Parameters(_): Parameters<NoArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn list_reminder_lists(&self) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.list_calendars() {
             Ok(lists) => {
@@ -259,6 +277,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ListRemindersRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         let reminders = if params.show_completed {
@@ -328,6 +347,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateReminderRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         // Validate the list exists - list_name is now required
@@ -412,6 +432,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<UpdateReminderRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         // Parse due date: Some("") means clear, Some(date) means set, None means no change
@@ -501,6 +522,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.create_calendar(&params.name) {
             Ok(calendar) => Ok(CallToolResult::success(vec![Content::text(format!(
@@ -519,6 +541,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<RenameReminderListRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.rename_calendar(&params.list_id, &params.new_name) {
             Ok(calendar) => Ok(CallToolResult::success(vec![Content::text(format!(
@@ -539,6 +562,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<DeleteReminderListRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.delete_calendar(&params.list_id) {
             Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
@@ -557,6 +581,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.complete_reminder(&params.reminder_id) {
             Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
@@ -575,6 +600,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.delete_reminder(&params.reminder_id) {
             Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
@@ -592,30 +618,9 @@ impl EventKitServer {
     // Calendar/Events Tools
     // ========================================================================
 
-    #[tool(
-        description = "Request authorization to access macOS Calendar. Must be called before using other calendar tools."
-    )]
-    async fn events_authorize(
-        &self,
-        Parameters(_): Parameters<NoArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let manager = EventsManager::new();
-        match manager.request_access() {
-            Ok(_) => Ok(CallToolResult::success(vec![Content::text(
-                "Successfully authorized access to Calendar.",
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error: {}",
-                e
-            ))])),
-        }
-    }
-
     #[tool(description = "List all calendars available in macOS Calendar app.")]
-    async fn list_calendars(
-        &self,
-        Parameters(_): Parameters<NoArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn list_calendars(&self) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.list_calendars() {
             Ok(calendars) => {
@@ -649,6 +654,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ListEventsRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let events = if params.days == 1 {
@@ -716,6 +722,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateEventRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let start = match parse_datetime(&params.start) {
@@ -780,6 +787,7 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<EventIdRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.delete_event(&params.event_id) {
             Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
@@ -794,20 +802,236 @@ impl EventKitServer {
     }
 }
 
+// ============================================================================
+// Prompts
+// ============================================================================
+
+#[prompt_router]
+impl EventKitServer {
+    /// List all incomplete (not yet finished) reminders, optionally filtered by list name.
+    #[prompt(name = "incomplete_reminders", description = "List all incomplete reminders")]
+    async fn incomplete_reminders(
+        &self,
+        Parameters(args): Parameters<ListRemindersPromptArgs>,
+    ) -> Result<GetPromptResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
+        let manager = RemindersManager::new();
+        let reminders = manager
+            .fetch_incomplete_reminders()
+            .map_err(|e| McpError::internal_error(format!("Failed to list reminders: {e}"), None))?;
+
+        // Filter by list name if provided
+        let reminders: Vec<_> = if let Some(ref name) = args.list_name {
+            reminders
+                .into_iter()
+                .filter(|r| r.calendar_title.as_deref() == Some(name.as_str()))
+                .collect()
+        } else {
+            reminders
+        };
+
+        let mut output = String::new();
+        for r in &reminders {
+            output.push_str(&format!(
+                "- [{}] {} (id: {}){}{}\n",
+                if r.completed { "x" } else { " " },
+                r.title,
+                r.identifier,
+                r.due_date
+                    .map(|d| format!(", due: {}", d.format("%Y-%m-%d %H:%M")))
+                    .unwrap_or_default(),
+                r.calendar_title
+                    .as_ref()
+                    .map(|l| format!(", list: {l}"))
+                    .unwrap_or_default(),
+            ));
+        }
+
+        if output.is_empty() {
+            output = "No incomplete reminders found.".to_string();
+        }
+
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Here are the current incomplete reminders:\n\n{output}\n\nPlease help me manage these reminders."
+            ),
+        )])
+        .with_description("Incomplete reminders"))
+    }
+
+    /// List all reminder lists (calendars) available in macOS Reminders.
+    #[prompt(
+        name = "reminder_lists",
+        description = "List all reminder lists available in Reminders"
+    )]
+    async fn reminder_lists_prompt(&self) -> Result<GetPromptResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
+        let manager = RemindersManager::new();
+        let lists = manager
+            .list_calendars()
+            .map_err(|e| McpError::internal_error(format!("Failed to list calendars: {e}"), None))?;
+
+        let mut output = String::new();
+        for list in &lists {
+            output.push_str(&format!("- {} (id: {})\n", list.title, list.identifier));
+        }
+
+        if output.is_empty() {
+            output = "No reminder lists found.".to_string();
+        }
+
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Here are the available reminder lists:\n\n{output}\n\nWhich list would you like to work with?"
+            ),
+        )])
+        .with_description("Available reminder lists"))
+    }
+
+    /// Move a reminder to a different reminder list.
+    #[prompt(
+        name = "move_reminder",
+        description = "Move a reminder to a different list"
+    )]
+    async fn move_reminder_prompt(
+        &self,
+        Parameters(args): Parameters<MoveReminderPromptArgs>,
+    ) -> Result<GetPromptResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
+        let manager = RemindersManager::new();
+
+        // Find the destination calendar
+        let lists = manager
+            .list_calendars()
+            .map_err(|e| McpError::internal_error(format!("Failed to list calendars: {e}"), None))?;
+
+        let dest = lists.iter().find(|l| {
+            l.title
+                .to_lowercase()
+                .contains(&args.destination_list.to_lowercase())
+        });
+
+        match dest {
+            Some(dest_list) => {
+                match manager.update_reminder(
+                    &args.reminder_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&dest_list.title),
+                ) {
+                    Ok(updated) => Ok(GetPromptResult::new(vec![
+                        PromptMessage::new_text(
+                            PromptMessageRole::User,
+                            format!(
+                                "Moved reminder \"{}\" to list \"{}\".",
+                                updated.title, dest_list.title
+                            ),
+                        ),
+                    ])
+                    .with_description("Reminder moved")),
+                    Err(e) => Ok(GetPromptResult::new(vec![
+                        PromptMessage::new_text(
+                            PromptMessageRole::User,
+                            format!("Failed to move reminder: {e}"),
+                        ),
+                    ])
+                    .with_description("Move failed")),
+                }
+            }
+            None => {
+                let available: Vec<&str> = lists.iter().map(|l| l.title.as_str()).collect();
+                Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                    PromptMessageRole::User,
+                    format!(
+                        "Could not find reminder list \"{}\". Available lists: {}",
+                        args.destination_list,
+                        available.join(", ")
+                    ),
+                )])
+                .with_description("List not found"))
+            }
+        }
+    }
+
+    /// Create a new reminder with optional notes, priority, due date, and list.
+    #[prompt(
+        name = "create_detailed_reminder",
+        description = "Create a reminder with detailed context like notes, priority, and due date"
+    )]
+    async fn create_detailed_reminder_prompt(
+        &self,
+        Parameters(args): Parameters<CreateReminderPromptArgs>,
+    ) -> Result<GetPromptResult, McpError> {
+        let _permit = self.concurrency.acquire().await.unwrap();
+        let manager = RemindersManager::new();
+
+        let due = args
+            .due_date
+            .as_deref()
+            .map(parse_datetime)
+            .transpose()
+            .map_err(|e| McpError::internal_error(format!("Invalid due date: {e}"), None))?;
+
+        match manager.create_reminder(
+            &args.title,
+            args.notes.as_deref(),
+            args.list_name.as_deref(),
+            args.priority.map(|p| p as usize),
+            due,
+            None,
+        ) {
+            Ok(reminder) => {
+                let mut details = format!("Created reminder: \"{}\"", reminder.title);
+                if let Some(notes) = &reminder.notes {
+                    details.push_str(&format!("\nNotes: {notes}"));
+                }
+                if reminder.priority > 0 {
+                    details.push_str(&format!("\nPriority: {}", reminder.priority));
+                }
+                if let Some(due) = &reminder.due_date {
+                    details.push_str(&format!("\nDue: {}", due.format("%Y-%m-%d %H:%M")));
+                }
+                if let Some(list) = &reminder.calendar_title {
+                    details.push_str(&format!("\nList: {list}"));
+                }
+
+                Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                    PromptMessageRole::User,
+                    details,
+                )])
+                .with_description("Reminder created"))
+            }
+            Err(e) => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("Failed to create reminder: {e}"),
+            )])
+            .with_description("Creation failed")),
+        }
+    }
+}
+
 // Implement the server handler
 #[tool_handler]
+#[prompt_handler]
 impl rmcp::ServerHandler for EventKitServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "This MCP server provides access to macOS Calendar events and Reminders. \
-                 Use the available tools to list, create, update, and delete calendar events \
-                 and reminders. You must call the authorization tools first before accessing data."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_instructions(
+            "This MCP server provides access to macOS Calendar events and Reminders. \
+             Use the available tools to list, create, update, and delete calendar events \
+             and reminders. Authorization is handled automatically on first use.",
+        )
     }
 }
 

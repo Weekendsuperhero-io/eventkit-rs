@@ -60,6 +60,8 @@ fn main() -> Result<()> {
         Some("Milk, eggs, bread"),
         None,  // Use default list
         Some(1),  // High priority
+        None,  // No due date
+        None,  // No start date
     )?;
     println!("Created: {}", reminder.title);
 
@@ -175,23 +177,19 @@ eventkit events delete <id> --force
 This library only works on **macOS**. It requires:
 
 - macOS 10.14 (Mojave) or later
-- Rust 1.92 or later
+- Rust 1.94 or later
 
 ## Privacy Permissions
 
 Your application needs to request permission to access Calendar and/or Reminders data. Add these keys to your `Info.plist`:
 
 ```xml
-<!-- For Reminders access -->
-<key>NSRemindersUsageDescription</key>
+<!-- For Reminders access (macOS 14+) -->
+<key>NSRemindersFullAccessUsageDescription</key>
 <string>This app needs access to your reminders to help you manage tasks.</string>
 
 <!-- For Calendar access (macOS 14+) -->
 <key>NSCalendarsFullAccessUsageDescription</key>
-<string>This app needs access to your calendar to manage events.</string>
-
-<!-- For Calendar access (older macOS) -->
-<key>NSCalendarsUsageDescription</key>
 <string>This app needs access to your calendar to manage events.</string>
 ```
 
@@ -240,9 +238,10 @@ The `mcp` module (enabled by default) provides a full MCP server:
 
 #### MCP Tools
 
+Authorization is handled automatically on first use — no separate authorize step needed.
+
 | Tool                   | Description                  |
 | ---------------------- | ---------------------------- |
-| `reminders_authorize`  | Request Reminders access     |
 | `list_reminder_lists`  | List all reminder lists      |
 | `list_reminders`       | List reminders (filterable)  |
 | `create_reminder`      | Create a new reminder        |
@@ -252,11 +251,19 @@ The `mcp` module (enabled by default) provides a full MCP server:
 | `create_reminder_list` | Create a new reminder list   |
 | `rename_reminder_list` | Rename a reminder list       |
 | `delete_reminder_list` | Delete a reminder list       |
-| `events_authorize`     | Request Calendar access      |
 | `list_calendars`       | List all calendars           |
 | `list_events`          | List events (by day range)   |
 | `create_event`         | Create a new calendar event  |
 | `delete_event`         | Delete a calendar event      |
+
+#### MCP Prompts
+
+| Prompt                      | Description                                            |
+| --------------------------- | ------------------------------------------------------ |
+| `incomplete_reminders`      | List all incomplete reminders (optionally by list)      |
+| `reminder_lists`            | List all available reminder lists                      |
+| `move_reminder`             | Move a reminder to a different list                    |
+| `create_detailed_reminder`  | Create a reminder with notes, priority, and due date   |
 
 #### MCP Configuration
 
