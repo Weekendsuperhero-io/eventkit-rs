@@ -31,7 +31,7 @@ block2 = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 objc2 = "0.6"
-objc2-event-kit = { version = "0.3.2", features = [
+objc2-event-kit = { version = "0.3", features = [
   "EKCalendar",
   "EKCalendarItem",
   "EKEvent",
@@ -42,7 +42,7 @@ objc2-event-kit = { version = "0.3.2", features = [
   "EKTypes",
   "block2",
 ] }
-objc2-foundation = { version = "0.3.2", features = [
+objc2-foundation = { version = "0.3", features = [
   "NSArray",
   "NSCalendar",
   "NSDate",
