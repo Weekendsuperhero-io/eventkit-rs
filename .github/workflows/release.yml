@@ -60,6 +60,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.94
 
+      - name: Update lockfile
+        run: cargo generate-lockfile
+
       - name: Publish to crates.io
         run: cargo publish
         env:
@@ -125,5 +128,3 @@ jobs:
             eventkit-x86_64-apple-darwin.tar.gz
             eventkit-aarch64-apple-darwin.tar.gz
             eventkit-universal-apple-darwin.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
