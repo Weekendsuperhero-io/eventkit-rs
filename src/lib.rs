@@ -53,11 +53,18 @@ use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
 use objc2_event_kit::{
-    EKAuthorizationStatus, EKCalendar, EKEntityType, EKEvent, EKEventStore, EKReminder, EKSpan,
+    EKAlarm, EKAlarmProximity, EKAuthorizationStatus, EKCalendar, EKCalendarItem, EKEntityType,
+    EKEvent, EKEventStore, EKRecurrenceDayOfWeek, EKRecurrenceEnd, EKRecurrenceFrequency,
+    EKRecurrenceRule, EKReminder, EKSource, EKSpan, EKStructuredLocation, EKWeekday,
 };
-use objc2_foundation::{NSArray, NSCalendar, NSDate, NSDateComponents, NSError, NSString};
+use objc2_foundation::{
+    NSArray, NSCalendar, NSDate, NSDateComponents, NSError, NSNumber, NSString,
+};
 use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
+
+#[cfg(feature = "location")]
+pub mod location;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -123,6 +130,8 @@ pub struct ReminderItem {
     pub priority: usize,
     /// Calendar/list the reminder belongs to
     pub calendar_title: Option<String>,
+    /// Calendar/list identifier
+    pub calendar_id: Option<String>,
     /// Due date for the reminder
     pub due_date: Option<DateTime<Local>>,
     /// Start date (when to start working on it)
@@ -149,9 +158,30 @@ pub struct ReminderItem {
     pub has_attendees: bool,
     /// Whether the reminder has notes
     pub has_notes: bool,
+    /// Attendees on this reminder (usually empty, possible on shared lists)
+    pub attendees: Vec<ParticipantInfo>,
 }
 
-/// Represents a calendar (reminder list)
+/// Type of calendar/source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarType {
+    Local,
+    CalDAV,
+    Exchange,
+    Subscription,
+    Birthday,
+    Unknown,
+}
+
+/// An account source (iCloud, Local, Exchange, etc.)
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub identifier: String,
+    pub title: String,
+    pub source_type: String,
+}
+
+/// Represents a calendar (reminder list or event calendar).
 #[derive(Debug, Clone)]
 pub struct CalendarInfo {
     /// Unique identifier
@@ -160,8 +190,92 @@ pub struct CalendarInfo {
     pub title: String,
     /// Source name (e.g., iCloud, Local)
     pub source: Option<String>,
-    /// Whether content can be modified
+    /// Source identifier
+    pub source_id: Option<String>,
+    /// Calendar type
+    pub calendar_type: CalendarType,
+    /// Whether items can be added/modified/deleted
     pub allows_modifications: bool,
+    /// Whether the calendar itself can be modified (renamed/deleted)
+    pub is_immutable: bool,
+    /// Whether this is a URL-subscribed read-only calendar
+    pub is_subscribed: bool,
+    /// Calendar color as RGBA (0.0-1.0)
+    pub color: Option<(f64, f64, f64, f64)>,
+    /// Entity types this calendar supports ("event", "reminder")
+    pub allowed_entity_types: Vec<String>,
+}
+
+/// Proximity trigger for a location-based alarm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmProximity {
+    /// No proximity trigger.
+    None,
+    /// Trigger when entering the location.
+    Enter,
+    /// Trigger when leaving the location.
+    Leave,
+}
+
+/// A structured location for geofenced alarms.
+#[derive(Debug, Clone)]
+pub struct StructuredLocation {
+    /// Display title for the location.
+    pub title: String,
+    /// Latitude of the location.
+    pub latitude: f64,
+    /// Longitude of the location.
+    pub longitude: f64,
+    /// Geofence radius in meters.
+    pub radius: f64,
+}
+
+/// An alarm attached to a reminder or event.
+#[derive(Debug, Clone)]
+pub struct AlarmInfo {
+    /// Offset in seconds before the due date (negative = before).
+    pub relative_offset: Option<f64>,
+    /// Absolute date for the alarm (ISO 8601 string).
+    pub absolute_date: Option<DateTime<Local>>,
+    /// Proximity trigger (enter/leave geofence).
+    pub proximity: AlarmProximity,
+    /// Location for geofenced alarms.
+    pub location: Option<StructuredLocation>,
+}
+
+/// How often a recurrence repeats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurrenceFrequency {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+/// When a recurrence ends.
+#[derive(Debug, Clone)]
+pub enum RecurrenceEndCondition {
+    /// Repeats forever.
+    Never,
+    /// Ends after a number of occurrences.
+    AfterCount(usize),
+    /// Ends on a specific date.
+    OnDate(DateTime<Local>),
+}
+
+/// A recurrence rule describing how a reminder or event repeats.
+#[derive(Debug, Clone)]
+pub struct RecurrenceRule {
+    /// How often it repeats (daily, weekly, monthly, yearly).
+    pub frequency: RecurrenceFrequency,
+    /// Repeat every N intervals (e.g., every 2 weeks).
+    pub interval: usize,
+    /// When the recurrence ends.
+    pub end: RecurrenceEndCondition,
+    /// Days of the week (1=Sun..7=Sat) for weekly/monthly rules.
+    pub days_of_week: Option<Vec<u8>>,
+    /// Days of the month (1-31, negatives count from end) for monthly rules.
+    pub days_of_month: Option<Vec<i32>>,
 }
 
 /// The main reminders manager providing access to EventKit functionality
@@ -254,6 +368,17 @@ impl RemindersManager {
             result.push(calendar_to_info(&calendar));
         }
 
+        Ok(result)
+    }
+
+    /// Lists all available sources (iCloud, Local, Exchange, etc.)
+    pub fn list_sources(&self) -> Result<Vec<SourceInfo>> {
+        self.ensure_authorized()?;
+        let sources = unsafe { self.store.sources() };
+        let mut result = Vec::new();
+        for source in sources.iter() {
+            result.push(source_to_info(&source));
+        }
         Ok(result)
     }
 
@@ -563,6 +688,110 @@ impl RemindersManager {
     }
 
     // ========================================================================
+    // Alarm Management
+    // ========================================================================
+
+    /// Lists all alarms on a reminder.
+    pub fn get_alarms(&self, identifier: &str) -> Result<Vec<AlarmInfo>> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        Ok(get_item_alarms(&reminder))
+    }
+
+    /// Adds an alarm to a reminder.
+    pub fn add_alarm(&self, identifier: &str, alarm: &AlarmInfo) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        add_item_alarm(&reminder, alarm);
+        unsafe {
+            self.store
+                .saveReminder_commit_error(&reminder, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Removes all alarms from a reminder.
+    pub fn remove_all_alarms(&self, identifier: &str) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        clear_item_alarms(&reminder);
+        unsafe {
+            self.store
+                .saveReminder_commit_error(&reminder, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Removes a specific alarm from a reminder by index.
+    pub fn remove_alarm(&self, identifier: &str, index: usize) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        remove_item_alarm(&reminder, index)?;
+        unsafe {
+            self.store
+                .saveReminder_commit_error(&reminder, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // URL Management
+    // ========================================================================
+
+    /// Set or clear the URL on a reminder.
+    pub fn set_url(&self, identifier: &str, url: Option<&str>) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        set_item_url(&reminder, url);
+        unsafe {
+            self.store
+                .saveReminder_commit_error(&reminder, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Recurrence Rule Management
+    // ========================================================================
+
+    /// Gets recurrence rules on a reminder.
+    pub fn get_recurrence_rules(&self, identifier: &str) -> Result<Vec<RecurrenceRule>> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        Ok(get_item_recurrence_rules(&reminder))
+    }
+
+    /// Sets a recurrence rule on a reminder (replaces any existing rules).
+    pub fn set_recurrence_rule(&self, identifier: &str, rule: &RecurrenceRule) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        set_item_recurrence_rule(&reminder, rule);
+        unsafe {
+            self.store
+                .saveReminder_commit_error(&reminder, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Removes all recurrence rules from a reminder.
+    pub fn remove_recurrence_rules(&self, identifier: &str) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        clear_item_recurrence_rules(&reminder);
+        unsafe {
+            self.store
+                .saveReminder_commit_error(&reminder, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    // ========================================================================
     // Calendar (Reminder List) Management
     // ========================================================================
 
@@ -596,23 +825,37 @@ impl RemindersManager {
     }
 
     /// Renames an existing reminder list (calendar)
+    /// Rename a reminder list (backward compat wrapper).
     pub fn rename_calendar(&self, identifier: &str, new_title: &str) -> Result<CalendarInfo> {
-        self.ensure_authorized()?;
+        self.update_calendar(identifier, Some(new_title), None)
+    }
 
+    /// Update a reminder list — name, color, or both.
+    pub fn update_calendar(
+        &self,
+        identifier: &str,
+        new_title: Option<&str>,
+        color_rgba: Option<(f64, f64, f64, f64)>,
+    ) -> Result<CalendarInfo> {
+        self.ensure_authorized()?;
         let calendar = self.find_calendar_by_id(identifier)?;
 
-        // Check if modifications are allowed
         if !unsafe { calendar.allowsContentModifications() } {
             return Err(EventKitError::SaveFailed(
                 "Calendar does not allow modifications".to_string(),
             ));
         }
 
-        // Set new title
-        let ns_title = NSString::from_str(new_title);
-        unsafe { calendar.setTitle(&ns_title) };
+        if let Some(title) = new_title {
+            let ns_title = NSString::from_str(title);
+            unsafe { calendar.setTitle(&ns_title) };
+        }
 
-        // Save changes
+        if let Some((r, g, b, a)) = color_rgba {
+            let cg = objc2_core_graphics::CGColor::new_srgb(r, g, b, a);
+            unsafe { calendar.setCGColor(Some(&cg)) };
+        }
+
         unsafe {
             self.store
                 .saveCalendar_commit_error(&calendar, true)
@@ -779,7 +1022,11 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
     let notes = unsafe { reminder.notes() }.map(|n| n.to_string());
     let completed = unsafe { reminder.isCompleted() };
     let priority = unsafe { reminder.priority() };
-    let calendar_title = unsafe { reminder.calendar() }.map(|c| unsafe { c.title() }.to_string());
+    let cal = unsafe { reminder.calendar() };
+    let calendar_title = cal.as_ref().map(|c| unsafe { c.title() }.to_string());
+    let calendar_id = cal
+        .as_ref()
+        .map(|c| unsafe { c.calendarIdentifier() }.to_string());
 
     // Extract due date from dueDateComponents
     let due_date = unsafe { reminder.dueDateComponents() }
@@ -817,6 +1064,7 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
         completed,
         priority,
         calendar_title,
+        calendar_id,
         due_date,
         start_date,
         completion_date,
@@ -830,21 +1078,94 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
         has_recurrence_rules,
         has_attendees,
         has_notes,
+        attendees: get_item_attendees(reminder),
     }
 }
 
 // Helper function to convert EKCalendar to CalendarInfo
+fn source_to_info(source: &EKSource) -> SourceInfo {
+    let identifier = unsafe { source.sourceIdentifier() }.to_string();
+    let title = unsafe { source.title() }.to_string();
+    // EKSourceType: 0=Local, 1=Exchange, 2=CalDAV, 3=MobileMe, 4=Subscribed, 5=Birthdays
+    let source_type = unsafe { source.sourceType() };
+    let source_type = match source_type.0 {
+        0 => "local",
+        1 => "exchange",
+        2 => "caldav",
+        3 => "mobileme",
+        4 => "subscribed",
+        5 => "birthdays",
+        _ => "unknown",
+    }
+    .to_string();
+
+    SourceInfo {
+        identifier,
+        title,
+        source_type,
+    }
+}
+
 fn calendar_to_info(calendar: &EKCalendar) -> CalendarInfo {
     let identifier = unsafe { calendar.calendarIdentifier() }.to_string();
     let title = unsafe { calendar.title() }.to_string();
     let source = unsafe { calendar.source() }.map(|s| unsafe { s.title() }.to_string());
+    let source_id =
+        unsafe { calendar.source() }.map(|s| unsafe { s.sourceIdentifier() }.to_string());
     let allows_modifications = unsafe { calendar.allowsContentModifications() };
+    let is_immutable = unsafe { calendar.isImmutable() };
+    let is_subscribed = unsafe { calendar.isSubscribed() };
+
+    // Calendar type: Local=0, CalDAV=1, Exchange=2, Subscription=3, Birthday=4
+    let cal_type = unsafe { calendar.r#type() };
+    let calendar_type = match cal_type.0 {
+        0 => CalendarType::Local,
+        1 => CalendarType::CalDAV,
+        2 => CalendarType::Exchange,
+        3 => CalendarType::Subscription,
+        4 => CalendarType::Birthday,
+        _ => CalendarType::Unknown,
+    };
+
+    // Read RGBA from CGColor
+    let color: Option<(f64, f64, f64, f64)> = unsafe {
+        calendar.CGColor().and_then(|cg| {
+            use objc2_core_graphics::CGColor as CG;
+            let n = CG::number_of_components(Some(&cg));
+            if n >= 3 {
+                let ptr = CG::components(Some(&cg));
+                let r = *ptr;
+                let g = *ptr.add(1);
+                let b = *ptr.add(2);
+                let a = if n >= 4 { *ptr.add(3) } else { 1.0 };
+                Some((r, g, b, a))
+            } else {
+                None
+            }
+        })
+    };
+
+    // Allowed entity types
+    let entity_mask = unsafe { calendar.allowedEntityTypes() };
+    let mut allowed_entity_types = Vec::new();
+    if entity_mask.0 & 1 != 0 {
+        allowed_entity_types.push("event".to_string());
+    }
+    if entity_mask.0 & 2 != 0 {
+        allowed_entity_types.push("reminder".to_string());
+    }
 
     CalendarInfo {
         identifier,
         title,
         source,
+        source_id,
+        calendar_type,
         allows_modifications,
+        is_immutable,
+        is_subscribed,
+        color,
+        allowed_entity_types,
     }
 }
 
@@ -852,7 +1173,59 @@ fn calendar_to_info(calendar: &EKCalendar) -> CalendarInfo {
 // Calendar Events Support
 // ============================================================================
 
-/// Represents a calendar event with its properties
+/// Event availability for scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventAvailability {
+    NotSupported,
+    Busy,
+    Free,
+    Tentative,
+    Unavailable,
+}
+
+/// Event status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventStatus {
+    None,
+    Confirmed,
+    Tentative,
+    Canceled,
+}
+
+/// Participant role in an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticipantRole {
+    Unknown,
+    Required,
+    Optional,
+    Chair,
+    NonParticipant,
+}
+
+/// Participant RSVP status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticipantStatus {
+    Unknown,
+    Pending,
+    Accepted,
+    Declined,
+    Tentative,
+    Delegated,
+    Completed,
+    InProcess,
+}
+
+/// A participant (attendee) on an event or reminder.
+#[derive(Debug, Clone)]
+pub struct ParticipantInfo {
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub role: ParticipantRole,
+    pub status: ParticipantStatus,
+    pub is_current_user: bool,
+}
+
+/// Represents a calendar event with its properties.
 #[derive(Debug, Clone)]
 pub struct EventItem {
     /// Unique identifier for the event
@@ -861,7 +1234,7 @@ pub struct EventItem {
     pub title: String,
     /// Optional notes/description
     pub notes: Option<String>,
-    /// Optional location
+    /// Optional location (string)
     pub location: Option<String>,
     /// Start date/time
     pub start_date: DateTime<Local>,
@@ -871,6 +1244,24 @@ pub struct EventItem {
     pub all_day: bool,
     /// Calendar the event belongs to
     pub calendar_title: Option<String>,
+    /// Calendar identifier
+    pub calendar_id: Option<String>,
+    /// URL associated with the event
+    pub url: Option<String>,
+    /// Availability for scheduling
+    pub availability: EventAvailability,
+    /// Event status (read-only)
+    pub status: EventStatus,
+    /// Whether this occurrence was modified from its recurring series
+    pub is_detached: bool,
+    /// Original date in a recurring series
+    pub occurrence_date: Option<DateTime<Local>>,
+    /// Geo-coordinate location
+    pub structured_location: Option<StructuredLocation>,
+    /// Attendees
+    pub attendees: Vec<ParticipantInfo>,
+    /// Event organizer
+    pub organizer: Option<ParticipantInfo>,
 }
 
 /// The events manager providing access to Calendar events via EventKit
@@ -1166,14 +1557,19 @@ impl EventsManager {
     }
 
     /// Deletes an event
-    pub fn delete_event(&self, identifier: &str) -> Result<()> {
+    pub fn delete_event(&self, identifier: &str, affect_future: bool) -> Result<()> {
         self.ensure_authorized()?;
 
         let event = self.find_event_by_id(identifier)?;
+        let span = if affect_future {
+            EKSpan::FutureEvents
+        } else {
+            EKSpan::ThisEvent
+        };
 
         unsafe {
             self.store
-                .removeEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+                .removeEvent_span_commit_error(&event, span, true)
                 .map_err(|e| EventKitError::DeleteFailed(format!("{:?}", e)))?;
         }
 
@@ -1185,6 +1581,176 @@ impl EventsManager {
         self.ensure_authorized()?;
         let event = self.find_event_by_id(identifier)?;
         Ok(event_to_item(&event))
+    }
+
+    // ========================================================================
+    // Event Calendar Management
+    // ========================================================================
+
+    /// Creates a new event calendar.
+    pub fn create_event_calendar(&self, title: &str) -> Result<CalendarInfo> {
+        self.ensure_authorized()?;
+        let calendar = unsafe {
+            EKCalendar::calendarForEntityType_eventStore(EKEntityType::Event, &self.store)
+        };
+        let ns_title = NSString::from_str(title);
+        unsafe { calendar.setTitle(&ns_title) };
+
+        // Use the default source
+        if let Some(default_cal) = unsafe { self.store.defaultCalendarForNewEvents() }
+            && let Some(source) = unsafe { default_cal.source() }
+        {
+            unsafe { calendar.setSource(Some(&source)) };
+        }
+
+        unsafe {
+            self.store
+                .saveCalendar_commit_error(&calendar, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(calendar_to_info(&calendar))
+    }
+
+    /// Renames an event calendar.
+    /// Rename an event calendar (backward compat wrapper).
+    pub fn rename_event_calendar(&self, identifier: &str, new_title: &str) -> Result<CalendarInfo> {
+        self.update_event_calendar(identifier, Some(new_title), None)
+    }
+
+    /// Update an event calendar — name, color, or both.
+    pub fn update_event_calendar(
+        &self,
+        identifier: &str,
+        new_title: Option<&str>,
+        color_rgba: Option<(f64, f64, f64, f64)>,
+    ) -> Result<CalendarInfo> {
+        self.ensure_authorized()?;
+        let calendar = unsafe {
+            self.store
+                .calendarWithIdentifier(&NSString::from_str(identifier))
+        }
+        .ok_or_else(|| EventKitError::CalendarNotFound(identifier.to_string()))?;
+
+        if let Some(title) = new_title {
+            let ns_title = NSString::from_str(title);
+            unsafe { calendar.setTitle(&ns_title) };
+        }
+
+        if let Some((r, g, b, a)) = color_rgba {
+            let cg = objc2_core_graphics::CGColor::new_srgb(r, g, b, a);
+            unsafe { calendar.setCGColor(Some(&cg)) };
+        }
+
+        unsafe {
+            self.store
+                .saveCalendar_commit_error(&calendar, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(calendar_to_info(&calendar))
+    }
+
+    /// Deletes an event calendar.
+    pub fn delete_event_calendar(&self, identifier: &str) -> Result<()> {
+        self.ensure_authorized()?;
+        let calendar = unsafe {
+            self.store
+                .calendarWithIdentifier(&NSString::from_str(identifier))
+        }
+        .ok_or_else(|| EventKitError::CalendarNotFound(identifier.to_string()))?;
+
+        unsafe {
+            self.store
+                .removeCalendar_commit_error(&calendar, true)
+                .map_err(|e| EventKitError::DeleteFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Event Alarm Management (shared via EKCalendarItem)
+    // ========================================================================
+
+    /// Lists all alarms on an event.
+    pub fn get_event_alarms(&self, identifier: &str) -> Result<Vec<AlarmInfo>> {
+        self.ensure_authorized()?;
+        let event = self.find_event_by_id(identifier)?;
+        Ok(get_item_alarms(&event))
+    }
+
+    /// Adds an alarm to an event.
+    pub fn add_event_alarm(&self, identifier: &str, alarm: &AlarmInfo) -> Result<()> {
+        self.ensure_authorized()?;
+        let event = self.find_event_by_id(identifier)?;
+        add_item_alarm(&event, alarm);
+        unsafe {
+            self.store
+                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Event Recurrence Management (shared via EKCalendarItem)
+    // ========================================================================
+
+    /// Gets recurrence rules on an event.
+    pub fn get_event_recurrence_rules(&self, identifier: &str) -> Result<Vec<RecurrenceRule>> {
+        self.ensure_authorized()?;
+        let event = self.find_event_by_id(identifier)?;
+        Ok(get_item_recurrence_rules(&event))
+    }
+
+    /// Sets a recurrence rule on an event (replaces any existing rules).
+    pub fn set_event_recurrence_rule(&self, identifier: &str, rule: &RecurrenceRule) -> Result<()> {
+        self.ensure_authorized()?;
+        let event = self.find_event_by_id(identifier)?;
+        set_item_recurrence_rule(&event, rule);
+        unsafe {
+            self.store
+                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Removes all recurrence rules from an event.
+    pub fn remove_event_recurrence_rules(&self, identifier: &str) -> Result<()> {
+        self.ensure_authorized()?;
+        let event = self.find_event_by_id(identifier)?;
+        clear_item_recurrence_rules(&event);
+        unsafe {
+            self.store
+                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Removes a specific alarm from an event by index.
+    pub fn remove_event_alarm(&self, identifier: &str, index: usize) -> Result<()> {
+        self.ensure_authorized()?;
+        let event = self.find_event_by_id(identifier)?;
+        remove_item_alarm(&event, index)?;
+        unsafe {
+            self.store
+                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Set or clear the URL on an event.
+    pub fn set_event_url(&self, identifier: &str, url: Option<&str>) -> Result<()> {
+        self.ensure_authorized()?;
+        let event = self.find_event_by_id(identifier)?;
+        set_item_url(&event, url);
+        unsafe {
+            self.store
+                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        }
+        Ok(())
     }
 
     // Helper to find a calendar by title
@@ -1228,13 +1794,66 @@ fn event_to_item(event: &EKEvent) -> EventItem {
     let notes = unsafe { event.notes() }.map(|n| n.to_string());
     let location = unsafe { event.location() }.map(|l| l.to_string());
     let all_day = unsafe { event.isAllDay() };
-    let calendar_title = unsafe { event.calendar() }.map(|c| unsafe { c.title() }.to_string());
+    let cal = unsafe { event.calendar() };
+    let calendar_title = cal.as_ref().map(|c| unsafe { c.title() }.to_string());
+    let calendar_id = cal
+        .as_ref()
+        .map(|c| unsafe { c.calendarIdentifier() }.to_string());
 
     let start_ns: Retained<NSDate> = unsafe { event.startDate() };
     let end_ns: Retained<NSDate> = unsafe { event.endDate() };
-
     let start_date = nsdate_to_datetime(&start_ns);
     let end_date = nsdate_to_datetime(&end_ns);
+
+    let url = get_item_url(event);
+
+    // Availability: -1=NotSupported, 0=Busy, 1=Free, 2=Tentative, 3=Unavailable
+    let avail = unsafe { event.availability() };
+    let availability = match avail.0 {
+        0 => EventAvailability::Busy,
+        1 => EventAvailability::Free,
+        2 => EventAvailability::Tentative,
+        3 => EventAvailability::Unavailable,
+        _ => EventAvailability::NotSupported,
+    };
+
+    // Status: 0=None, 1=Confirmed, 2=Tentative, 3=Canceled
+    let stat = unsafe { event.status() };
+    let status = match stat.0 {
+        1 => EventStatus::Confirmed,
+        2 => EventStatus::Tentative,
+        3 => EventStatus::Canceled,
+        _ => EventStatus::None,
+    };
+
+    let is_detached = unsafe { event.isDetached() };
+    let occurrence_date = unsafe { event.occurrenceDate() }.map(|d| nsdate_to_datetime(&d));
+
+    // Structured location
+    let structured_location = unsafe { event.structuredLocation() }.map(|loc| {
+        let title = unsafe { loc.title() }
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        let radius = unsafe { loc.radius() };
+        let (latitude, longitude) = unsafe { loc.geoLocation() }
+            .map(|geo| {
+                let coord = unsafe { geo.coordinate() };
+                (coord.latitude, coord.longitude)
+            })
+            .unwrap_or((0.0, 0.0));
+        StructuredLocation {
+            title,
+            latitude,
+            longitude,
+            radius,
+        }
+    });
+
+    // Attendees (shared via EKCalendarItem)
+    let attendees = get_item_attendees(event);
+
+    // Organizer (event-only)
+    let organizer = unsafe { event.organizer() }.map(|p| participant_to_info(&p));
 
     EventItem {
         identifier,
@@ -1245,6 +1864,69 @@ fn event_to_item(event: &EKEvent) -> EventItem {
         end_date,
         all_day,
         calendar_title,
+        calendar_id,
+        url,
+        availability,
+        status,
+        is_detached,
+        occurrence_date,
+        structured_location,
+        attendees,
+        organizer,
+    }
+}
+
+// Read attendees from an EKCalendarItem (shared by events and reminders)
+fn get_item_attendees(item: &EKCalendarItem) -> Vec<ParticipantInfo> {
+    let attendees = unsafe { item.attendees() };
+    let Some(attendees) = attendees else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for i in 0..attendees.len() {
+        let p = attendees.objectAtIndex(i);
+        result.push(participant_to_info(&p));
+    }
+    result
+}
+
+// Convert an EKParticipant to ParticipantInfo
+fn participant_to_info(p: &objc2_event_kit::EKParticipant) -> ParticipantInfo {
+    let name = unsafe { p.name() }.map(|n| n.to_string());
+    let url = unsafe { p.URL() }.absoluteString().map(|s| s.to_string());
+
+    // Role: 0=Unknown, 1=Required, 2=Optional, 3=Chair, 4=NonParticipant
+    let role = unsafe { p.participantRole() };
+    let role = match role.0 {
+        1 => ParticipantRole::Required,
+        2 => ParticipantRole::Optional,
+        3 => ParticipantRole::Chair,
+        4 => ParticipantRole::NonParticipant,
+        _ => ParticipantRole::Unknown,
+    };
+
+    // Status: 0=Unknown, 1=Pending, 2=Accepted, 3=Declined, 4=Tentative,
+    //         5=Delegated, 6=Completed, 7=InProcess
+    let status = unsafe { p.participantStatus() };
+    let status = match status.0 {
+        1 => ParticipantStatus::Pending,
+        2 => ParticipantStatus::Accepted,
+        3 => ParticipantStatus::Declined,
+        4 => ParticipantStatus::Tentative,
+        5 => ParticipantStatus::Delegated,
+        6 => ParticipantStatus::Completed,
+        7 => ParticipantStatus::InProcess,
+        _ => ParticipantStatus::Unknown,
+    };
+
+    let is_current_user = unsafe { p.isCurrentUser() };
+
+    ParticipantInfo {
+        name,
+        url,
+        role,
+        status,
+        is_current_user,
     }
 }
 
@@ -1285,6 +1967,302 @@ fn datetime_to_date_components(dt: DateTime<Local>) -> Retained<NSDateComponents
     components
 }
 
+// ============================================================================
+// Shared EKCalendarItem operations
+// ============================================================================
+// EKCalendarItem is the base class for both EKReminder and EKEvent.
+// These functions operate on the shared interface — both types auto-deref to it.
+
+/// Read all alarms from a calendar item.
+fn get_item_alarms(item: &EKCalendarItem) -> Vec<AlarmInfo> {
+    let alarms = unsafe { item.alarms() };
+    let Some(alarms) = alarms else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for i in 0..alarms.len() {
+        let alarm = alarms.objectAtIndex(i);
+        result.push(alarm_to_info(&alarm));
+    }
+    result
+}
+
+/// Add an alarm to a calendar item.
+fn add_item_alarm(item: &EKCalendarItem, alarm: &AlarmInfo) {
+    let ek_alarm = create_ek_alarm(alarm);
+    unsafe { item.addAlarm(&ek_alarm) };
+}
+
+/// Remove an alarm from a calendar item by index.
+fn remove_item_alarm(item: &EKCalendarItem, index: usize) -> Result<()> {
+    let alarms = unsafe { item.alarms() };
+    let Some(alarms) = alarms else {
+        return Err(EventKitError::ItemNotFound("No alarms on this item".into()));
+    };
+    if index >= alarms.len() {
+        return Err(EventKitError::ItemNotFound(format!(
+            "Alarm index {} out of range ({})",
+            index,
+            alarms.len()
+        )));
+    }
+    let alarm = alarms.objectAtIndex(index);
+    unsafe { item.removeAlarm(&alarm) };
+    Ok(())
+}
+
+/// Clear all alarms from a calendar item.
+fn clear_item_alarms(item: &EKCalendarItem) {
+    unsafe { item.setAlarms(None) };
+}
+
+/// Read all recurrence rules from a calendar item.
+fn get_item_recurrence_rules(item: &EKCalendarItem) -> Vec<RecurrenceRule> {
+    let rules = unsafe { item.recurrenceRules() };
+    let Some(rules) = rules else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for i in 0..rules.len() {
+        let rule = rules.objectAtIndex(i);
+        result.push(recurrence_rule_to_info(&rule));
+    }
+    result
+}
+
+/// Set a single recurrence rule on a calendar item (replaces any existing).
+fn set_item_recurrence_rule(item: &EKCalendarItem, rule: &RecurrenceRule) {
+    let ek_rule = create_ek_recurrence_rule(rule);
+    unsafe {
+        let rules = NSArray::from_retained_slice(&[ek_rule]);
+        item.setRecurrenceRules(Some(&rules));
+    }
+}
+
+/// Clear all recurrence rules from a calendar item.
+fn clear_item_recurrence_rules(item: &EKCalendarItem) {
+    unsafe { item.setRecurrenceRules(None) };
+}
+
+/// Set URL on a calendar item.
+fn set_item_url(item: &EKCalendarItem, url: Option<&str>) {
+    unsafe {
+        let ns_url = url.map(|u| {
+            let ns_str = NSString::from_str(u);
+            objc2_foundation::NSURL::URLWithString(&ns_str).unwrap()
+        });
+        item.setURL(ns_url.as_deref());
+    }
+}
+
+/// Read URL from a calendar item.
+fn get_item_url(item: &EKCalendarItem) -> Option<String> {
+    unsafe { item.URL() }.map(|u| u.absoluteString().unwrap().to_string())
+}
+
+// ============================================================================
+// Type conversion helpers
+// ============================================================================
+
+// Helper to convert an EKRecurrenceRule to a RecurrenceRule
+fn recurrence_rule_to_info(rule: &EKRecurrenceRule) -> RecurrenceRule {
+    let frequency = unsafe { rule.frequency() };
+    let frequency = match frequency {
+        EKRecurrenceFrequency::Daily => RecurrenceFrequency::Daily,
+        EKRecurrenceFrequency::Weekly => RecurrenceFrequency::Weekly,
+        EKRecurrenceFrequency::Monthly => RecurrenceFrequency::Monthly,
+        EKRecurrenceFrequency::Yearly => RecurrenceFrequency::Yearly,
+        _ => RecurrenceFrequency::Daily,
+    };
+
+    let interval = unsafe { rule.interval() } as usize;
+
+    let end = unsafe { rule.recurrenceEnd() }
+        .map(|end| {
+            let count = unsafe { end.occurrenceCount() };
+            if count > 0 {
+                RecurrenceEndCondition::AfterCount(count)
+            } else if let Some(date) = unsafe { end.endDate() } {
+                RecurrenceEndCondition::OnDate(nsdate_to_datetime(&date))
+            } else {
+                RecurrenceEndCondition::Never
+            }
+        })
+        .unwrap_or(RecurrenceEndCondition::Never);
+
+    let days_of_week = unsafe { rule.daysOfTheWeek() }.map(|days| {
+        let mut result = Vec::new();
+        for i in 0..days.len() {
+            let day = days.objectAtIndex(i);
+            let weekday = unsafe { day.dayOfTheWeek() };
+            result.push(weekday.0 as u8);
+        }
+        result
+    });
+
+    let days_of_month = unsafe { rule.daysOfTheMonth() }.map(|days| {
+        let mut result = Vec::new();
+        for i in 0..days.len() {
+            let num = days.objectAtIndex(i);
+            result.push(num.intValue());
+        }
+        result
+    });
+
+    RecurrenceRule {
+        frequency,
+        interval,
+        end,
+        days_of_week,
+        days_of_month,
+    }
+}
+
+// Helper to create an EKRecurrenceRule from a RecurrenceRule
+fn create_ek_recurrence_rule(rule: &RecurrenceRule) -> Retained<EKRecurrenceRule> {
+    let frequency = match rule.frequency {
+        RecurrenceFrequency::Daily => EKRecurrenceFrequency::Daily,
+        RecurrenceFrequency::Weekly => EKRecurrenceFrequency::Weekly,
+        RecurrenceFrequency::Monthly => EKRecurrenceFrequency::Monthly,
+        RecurrenceFrequency::Yearly => EKRecurrenceFrequency::Yearly,
+    };
+
+    let end = match &rule.end {
+        RecurrenceEndCondition::Never => None,
+        RecurrenceEndCondition::AfterCount(count) => {
+            Some(unsafe { EKRecurrenceEnd::recurrenceEndWithOccurrenceCount(*count) })
+        }
+        RecurrenceEndCondition::OnDate(date) => {
+            let nsdate = datetime_to_nsdate(*date);
+            Some(unsafe { EKRecurrenceEnd::recurrenceEndWithEndDate(&nsdate) })
+        }
+    };
+
+    let days_of_week: Option<Vec<Retained<EKRecurrenceDayOfWeek>>> =
+        rule.days_of_week.as_ref().map(|days| {
+            days.iter()
+                .map(|&d| {
+                    let weekday = EKWeekday(d as isize);
+                    unsafe { EKRecurrenceDayOfWeek::dayOfWeek(weekday) }
+                })
+                .collect()
+        });
+
+    let days_of_month: Option<Vec<Retained<NSNumber>>> = rule
+        .days_of_month
+        .as_ref()
+        .map(|days| days.iter().map(|&d| NSNumber::new_i32(d)).collect());
+
+    let days_of_week_arr = days_of_week
+        .as_ref()
+        .map(|v| NSArray::from_retained_slice(v));
+    let days_of_month_arr = days_of_month
+        .as_ref()
+        .map(|v| NSArray::from_retained_slice(v));
+
+    unsafe {
+        use objc2::AnyThread;
+        EKRecurrenceRule::initRecurrenceWithFrequency_interval_daysOfTheWeek_daysOfTheMonth_monthsOfTheYear_weeksOfTheYear_daysOfTheYear_setPositions_end(
+            EKRecurrenceRule::alloc(),
+            frequency,
+            rule.interval as isize,
+            days_of_week_arr.as_deref(),
+            days_of_month_arr.as_deref(),
+            None, // months of year
+            None, // weeks of year
+            None, // days of year
+            None, // set positions
+            end.as_deref(),
+        )
+    }
+}
+
+// Helper to convert an EKAlarm to an AlarmInfo
+fn alarm_to_info(alarm: &EKAlarm) -> AlarmInfo {
+    let relative_offset = unsafe { alarm.relativeOffset() };
+    let absolute_date = unsafe { alarm.absoluteDate() }.map(|d| nsdate_to_datetime(&d));
+
+    let proximity = unsafe { alarm.proximity() };
+    let proximity = match proximity {
+        EKAlarmProximity::Enter => AlarmProximity::Enter,
+        EKAlarmProximity::Leave => AlarmProximity::Leave,
+        _ => AlarmProximity::None,
+    };
+
+    let location = unsafe { alarm.structuredLocation() }.map(|loc| {
+        let title = unsafe { loc.title() }
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        let radius = unsafe { loc.radius() };
+        let (latitude, longitude) = unsafe { loc.geoLocation() }
+            .map(|geo| {
+                let coord = unsafe { geo.coordinate() };
+                (coord.latitude, coord.longitude)
+            })
+            .unwrap_or((0.0, 0.0));
+
+        StructuredLocation {
+            title,
+            latitude,
+            longitude,
+            radius,
+        }
+    });
+
+    AlarmInfo {
+        // relativeOffset of 0 means "at time of event" — it's always set
+        relative_offset: Some(relative_offset),
+        absolute_date,
+        proximity,
+        location,
+    }
+}
+
+// Helper to create an EKAlarm from an AlarmInfo
+fn create_ek_alarm(info: &AlarmInfo) -> Retained<EKAlarm> {
+    let alarm = if let Some(date) = &info.absolute_date {
+        let nsdate = datetime_to_nsdate(*date);
+        unsafe { EKAlarm::alarmWithAbsoluteDate(&nsdate) }
+    } else {
+        let offset = info.relative_offset.unwrap_or(0.0);
+        unsafe { EKAlarm::alarmWithRelativeOffset(offset) }
+    };
+
+    // Set proximity
+    let prox = match info.proximity {
+        AlarmProximity::Enter => EKAlarmProximity::Enter,
+        AlarmProximity::Leave => EKAlarmProximity::Leave,
+        AlarmProximity::None => EKAlarmProximity::None,
+    };
+    unsafe { alarm.setProximity(prox) };
+
+    // Set structured location if provided
+    if let Some(loc) = &info.location {
+        let title = NSString::from_str(&loc.title);
+        let structured = unsafe { EKStructuredLocation::locationWithTitle(&title) };
+        unsafe { structured.setRadius(loc.radius) };
+
+        // Create CLLocation for the geo coordinates
+        #[cfg(feature = "location")]
+        {
+            use objc2::AnyThread;
+            use objc2_core_location::CLLocation;
+            let cl_location = unsafe {
+                CLLocation::initWithLatitude_longitude(
+                    CLLocation::alloc(),
+                    loc.latitude,
+                    loc.longitude,
+                )
+            };
+            unsafe { structured.setGeoLocation(Some(&cl_location)) };
+        }
+
+        unsafe { alarm.setStructuredLocation(Some(&structured)) };
+    }
+
+    alarm
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,6 +2290,15 @@ mod tests {
             end_date: Local::now(),
             all_day: false,
             calendar_title: None,
+            calendar_id: None,
+            url: None,
+            availability: EventAvailability::Busy,
+            status: EventStatus::None,
+            is_detached: false,
+            occurrence_date: None,
+            structured_location: None,
+            attendees: Vec::new(),
+            organizer: None,
         };
         assert!(format!("{:?}", event).contains("Test Event"));
     }

@@ -35,6 +35,11 @@ enum Commands {
         #[arg(short, long)]
         events: bool,
     },
+
+    /// Dump raw objects as JSON for debugging
+    #[cfg(feature = "mcp")]
+    #[command(subcommand)]
+    Dump(DumpCommands),
 }
 
 #[derive(Subcommand)]
@@ -211,6 +216,39 @@ enum EventsCommands {
     },
 }
 
+#[cfg(feature = "mcp")]
+#[derive(Subcommand)]
+enum DumpCommands {
+    /// Dump a single reminder with all fields, alarms, recurrence as JSON
+    Reminder {
+        /// Identifier of the reminder
+        id: String,
+    },
+    /// Dump all reminders in a list (or all lists) as JSON
+    Reminders {
+        /// Filter to a specific list name
+        #[arg(short, long)]
+        list: Option<String>,
+    },
+    /// Dump a single event with all fields, alarms, recurrence, attendees as JSON
+    Event {
+        /// Identifier of the event
+        id: String,
+    },
+    /// Dump events for the next N days as JSON
+    Events {
+        /// Number of days (default: 7)
+        #[arg(short, long, default_value = "7")]
+        days: i64,
+    },
+    /// Dump all reminder lists as JSON
+    ReminderLists,
+    /// Dump all event calendars as JSON
+    Calendars,
+    /// Dump all sources as JSON
+    Sources,
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -235,6 +273,8 @@ fn main() {
 
     let result = match command {
         Commands::Status { events } => cmd_status(events),
+        #[cfg(feature = "mcp")]
+        Commands::Dump(cmd) => cmd_dump(cmd),
         Commands::Reminders(cmd) => match cmd {
             RemindersCommands::Authorize => cmd_reminders_authorize(),
             RemindersCommands::Lists => cmd_reminders_lists(),
@@ -850,9 +890,24 @@ fn cmd_events_delete(id: &str, force: bool) -> Result<(), EventKitError> {
         return Ok(());
     }
 
-    manager.delete_event(id)?;
+    manager.delete_event(id, false)?;
     println!("✓ Deleted: {}", event.title);
 
+    Ok(())
+}
+
+#[cfg(feature = "mcp")]
+fn cmd_dump(cmd: DumpCommands) -> Result<(), EventKitError> {
+    let json = match cmd {
+        DumpCommands::Reminder { id } => eventkit::mcp::dump_reminder(&id)?,
+        DumpCommands::Reminders { list } => eventkit::mcp::dump_reminders(list.as_deref())?,
+        DumpCommands::Event { id } => eventkit::mcp::dump_event(&id)?,
+        DumpCommands::Events { days } => eventkit::mcp::dump_events(days)?,
+        DumpCommands::ReminderLists => eventkit::mcp::dump_reminder_lists()?,
+        DumpCommands::Calendars => eventkit::mcp::dump_calendars()?,
+        DumpCommands::Sources => eventkit::mcp::dump_sources()?,
+    };
+    println!("{json}");
     Ok(())
 }
 

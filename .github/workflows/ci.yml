@@ -1,3 +1,14 @@
+# CI — runs on push/PR to main
+#
+# Run locally before pushing:
+#   cargo fmt --all                                          # fix formatting
+#   cargo clippy --all-targets --all-features --fix --allow-dirty  # fix lint warnings
+#   cargo test --all-features                                # run tests
+#
+# Check only (same as CI, no modifications):
+#   cargo fmt --all -- --check
+#   cargo clippy --all-targets --all-features -- -D warnings
+
 name: CI
 
 on:
@@ -17,7 +28,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@1.94
         with:
           components: rustfmt, clippy
 
@@ -56,7 +67,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@1.94
         with:
           targets: ${{ matrix.target }}
 
@@ -81,7 +92,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@1.94
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features
