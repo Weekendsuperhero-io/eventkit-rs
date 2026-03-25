@@ -1,6 +1,6 @@
 [package]
 name = "eventkit-rs"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 description = "A Rust library and CLI for managing macOS Calendar events and Reminders via EventKit"
 license = "Apache-2.0"
@@ -32,49 +32,14 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 objc2 = "0.6"
 objc2-core-graphics = { version = "0.3", features = ["CGColor"] }
-objc2-core-location = { version = "0.3", features = [
-  "CLLocation",
-  "CLLocationManager",
-], optional = true }
-objc2-event-kit = { version = "0.3", features = [
-  "EKAlarm",
-  "EKCalendar",
-  "EKCalendarItem",
-  "EKEvent",
-  "EKEventStore",
-  "EKObject",
-  "EKParticipant",
-  "EKRecurrenceDayOfWeek",
-  "EKRecurrenceEnd",
-  "EKRecurrenceRule",
-  "EKReminder",
-  "EKSource",
-  "EKStructuredLocation",
-  "EKTypes",
-  "block2",
-  "objc2-core-graphics",
-] }
-objc2-foundation = { version = "0.3", features = [
-  "NSArray",
-  "NSCalendar",
-  "NSDate",
-  "NSError",
-  "NSPredicate",
-  "NSString",
-  "NSTimeZone",
-  "NSURL",
-  "NSValue",
-] }
-rmcp = { version = "1.2", features = [
-  "macros",
-  "server",
-  "transport-async-rw",
-  "transport-io"
-], optional = true }
+objc2-core-location = { version = "0.3", features = ["CLLocation", "CLLocationManager"], optional = true }
+objc2-event-kit = { version = "0.3", features = ["EKAlarm", "EKCalendar", "EKCalendarItem", "EKEvent", "EKEventStore", "EKObject", "EKParticipant", "EKRecurrenceDayOfWeek", "EKRecurrenceEnd", "EKRecurrenceRule", "EKReminder", "EKSource", "EKStructuredLocation", "EKTypes", "block2", "objc2-core-graphics"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSCalendar", "NSDate", "NSError", "NSPredicate", "NSString", "NSTimeZone", "NSURL", "NSValue"] }
+rmcp = { version = "1.2", features = ["macros", "server", "transport-async-rw", "transport-io"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["full"], optional = true }
+tokio = { version = "1.50", features = ["full"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
