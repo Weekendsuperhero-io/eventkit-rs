@@ -438,6 +438,7 @@ fn cmd_reminders_lists() -> Result<(), EventKitError> {
     Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn cmd_reminders_list(
     list_filter: Option<Vec<String>>,
     incomplete: bool,
@@ -450,7 +451,7 @@ fn cmd_reminders_list(
     let reminders = if incomplete {
         manager.fetch_incomplete_reminders()?
     } else if let Some(ref lists) = list_filter {
-        let list_refs: Vec<&str> = lists.iter().map(|s| s.as_str()).collect();
+        let list_refs: Vec<&str> = lists.iter().map(std::string::String::as_str).collect();
         manager.fetch_reminders(Some(&list_refs))?
     } else {
         manager.fetch_all_reminders()?
@@ -753,6 +754,7 @@ fn cmd_events_calendars() -> Result<(), EventKitError> {
     Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn cmd_events_list(
     today: bool,
     days: i64,
@@ -764,7 +766,7 @@ fn cmd_events_list(
     let events = if today {
         manager.fetch_today_events()?
     } else if let Some(ref cals) = calendar_filter {
-        let cal_refs: Vec<&str> = cals.iter().map(|s| s.as_str()).collect();
+        let cal_refs: Vec<&str> = cals.iter().map(std::string::String::as_str).collect();
         let now = Local::now();
         let end = now + Duration::days(days);
         manager.fetch_events(now, end, Some(&cal_refs))?
