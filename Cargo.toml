@@ -60,3 +60,6 @@ mcp = [
   "dep:tracing-subscriber"
 ]
 reminders = []
+
+[lints]
+workspace = true

@@ -1146,7 +1146,7 @@ impl EventKitServer {
     ) -> Result<Json<CalendarOutput>, McpError> {
         let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
-        let color_rgba = params.color.as_ref().map(|c| c.to_rgba());
+        let color_rgba = params.color.as_ref().map(CalendarColor::to_rgba);
         match manager.update_calendar(&params.list_id, params.name.as_deref(), color_rgba) {
             Ok(cal) => Ok(Json(CalendarOutput::from_info(&cal))),
             Err(e) => Err(mcp_err(&e)),
@@ -1413,7 +1413,7 @@ impl EventKitServer {
         let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
-        let color_rgba = params.color.as_ref().map(|c| c.to_rgba());
+        let color_rgba = params.color.as_ref().map(CalendarColor::to_rgba);
 
         match manager.update_event_calendar(&params.calendar_id, params.name.as_deref(), color_rgba)
         {
@@ -1917,7 +1917,7 @@ fn apply_tags(notes: Option<&str>, tags: &[String]) -> String {
         .map(String::from)
         .collect();
     // Remove trailing empty lines
-    while result.last().is_some_and(|l| l.is_empty()) {
+    while result.last().is_some_and(std::string::String::is_empty) {
         result.pop();
     }
     if !tags.is_empty() {
