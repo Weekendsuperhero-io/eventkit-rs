@@ -3,14 +3,14 @@ name = "eventkit-rs"
 version = "0.4.3"
 edition = "2024"
 description = "A Rust library and CLI for managing macOS Calendar events and Reminders via EventKit"
-license = "Apache-2.0"
-repository = "https://github.com/weekendsuperhero-io/eventkit-rs"
 documentation = "https://docs.rs/eventkit-rs"
-homepage = "https://github.com/weekendsuperhero-io/eventkit-rs"
 readme = "README.md"
+homepage = "https://github.com/weekendsuperhero-io/eventkit-rs"
+repository = "https://github.com/weekendsuperhero-io/eventkit-rs"
+license = "Apache-2.0"
 keywords = ["apple", "calendar", "eventkit", "macos", "reminders"]
 categories = ["api-bindings", "os::macos-apis"]
-authors = ["WeekendSuperhero <hello@weekendsuperhero.io>"]
+
 rust-version = "1.94"
 
 [package.metadata.docs.rs]
@@ -32,10 +32,45 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 objc2 = "0.6"
 objc2-core-graphics = { version = "0.3", features = ["CGColor"] }
-objc2-core-location = { version = "0.3", features = ["CLLocation", "CLLocationManager"], optional = true }
-objc2-event-kit = { version = "0.3", features = ["EKAlarm", "EKCalendar", "EKCalendarItem", "EKEvent", "EKEventStore", "EKObject", "EKParticipant", "EKRecurrenceDayOfWeek", "EKRecurrenceEnd", "EKRecurrenceRule", "EKReminder", "EKSource", "EKStructuredLocation", "EKTypes", "block2", "objc2-core-graphics"] }
-objc2-foundation = { version = "0.3", features = ["NSArray", "NSCalendar", "NSDate", "NSError", "NSPredicate", "NSString", "NSTimeZone", "NSURL", "NSValue"] }
-rmcp = { version = "1.2", features = ["macros", "server", "transport-async-rw", "transport-io"], optional = true }
+objc2-core-location = { version = "0.3", features = [
+  "CLLocation",
+  "CLLocationManager"
+], optional = true }
+objc2-event-kit = { version = "0.3", features = [
+  "EKAlarm",
+  "EKCalendar",
+  "EKCalendarItem",
+  "EKEvent",
+  "EKEventStore",
+  "EKObject",
+  "EKParticipant",
+  "EKRecurrenceDayOfWeek",
+  "EKRecurrenceEnd",
+  "EKRecurrenceRule",
+  "EKReminder",
+  "EKSource",
+  "EKStructuredLocation",
+  "EKTypes",
+  "block2",
+  "objc2-core-graphics"
+] }
+objc2-foundation = { version = "0.3", features = [
+  "NSArray",
+  "NSCalendar",
+  "NSDate",
+  "NSError",
+  "NSPredicate",
+  "NSString",
+  "NSTimeZone",
+  "NSURL",
+  "NSValue"
+] }
+rmcp = { version = "1.2", features = [
+  "macros",
+  "server",
+  "transport-async-rw",
+  "transport-io"
+], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 thiserror = "2"
@@ -60,6 +95,3 @@ mcp = [
   "dep:tracing-subscriber"
 ]
 reminders = []
-
-[lints]
-workspace = true
