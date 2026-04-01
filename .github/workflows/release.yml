@@ -18,7 +18,7 @@ permissions:
 jobs:
   validate:
     name: Validate Release
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -53,7 +53,7 @@ jobs:
   publish-crates-io:
     name: Publish to crates.io
     needs: validate
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -71,7 +71,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     needs: validate
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
