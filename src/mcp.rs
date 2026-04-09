@@ -40,6 +40,7 @@ fn mcp_invalid(msg: impl std::fmt::Display) -> McpError {
 
 #[derive(Serialize, JsonSchema)]
 struct ListResponse<T: Serialize> {
+    #[schemars(with = "i64")]
     count: usize,
     items: Vec<T>,
 }
@@ -51,8 +52,11 @@ struct DeletedResponse {
 
 #[derive(Serialize, JsonSchema)]
 struct BatchResponse {
+    #[schemars(with = "i64")]
     total: usize,
+    #[schemars(with = "i64")]
     succeeded: usize,
+    #[schemars(with = "i64")]
     failed: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<BatchItemError>,
@@ -122,8 +126,10 @@ impl AlarmOutput {
 #[derive(Serialize, JsonSchema)]
 struct RecurrenceRuleOutput {
     frequency: String,
+    #[schemars(with = "i64")]
     interval: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<i32>>")]
     days_of_week: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     days_of_month: Option<Vec<i32>>,
@@ -134,7 +140,10 @@ struct RecurrenceRuleOutput {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RecurrenceEndOutput {
     Never,
-    AfterCount { count: usize },
+    AfterCount {
+        #[schemars(with = "i64")]
+        count: usize,
+    },
     OnDate { date: String },
 }
 
@@ -485,12 +494,15 @@ pub struct RecurrenceParam {
     pub frequency: String,
     /// Repeat every N intervals (e.g., 2 = every 2 weeks). Default: 1
     #[serde(default = "default_interval")]
+    #[schemars(with = "i64")]
     pub interval: usize,
     /// Days of the week (1=Sun, 2=Mon, ..., 7=Sat) for weekly/monthly rules
+    #[schemars(with = "Option<Vec<i32>>")]
     pub days_of_week: Option<Vec<u8>>,
     /// Days of the month (1-31) for monthly rules
     pub days_of_month: Option<Vec<i32>>,
     /// End after this many occurrences (mutually exclusive with end_date)
+    #[schemars(with = "Option<i64>")]
     pub end_after_count: Option<usize>,
     /// End on this date in format 'YYYY-MM-DD' (mutually exclusive with end_after_count)
     pub end_date: Option<String>,
@@ -830,6 +842,7 @@ pub struct CreateReminderPromptArgs {
     pub list_name: Option<String>,
     /// Priority (0 = none, 1-4 = high, 5 = medium, 6-9 = low)
     #[serde(default)]
+    #[schemars(with = "Option<i32>")]
     pub priority: Option<u8>,
     /// Due date in format "YYYY-MM-DD" or "YYYY-MM-DD HH:MM"
     #[serde(default)]
