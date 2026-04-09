@@ -144,7 +144,9 @@ enum RecurrenceEndOutput {
         #[schemars(with = "i64")]
         count: usize,
     },
-    OnDate { date: String },
+    OnDate {
+        date: String,
+    },
 }
 
 impl RecurrenceRuleOutput {
