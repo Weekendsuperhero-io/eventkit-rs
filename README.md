@@ -35,14 +35,14 @@ cargo install eventkit-rs
 
 ```toml
 [dependencies]
-eventkit-rs = "0.3"
+eventkit-rs = "0.5"
 ```
 
 Without MCP dependencies:
 
 ```toml
 [dependencies]
-eventkit-rs = { version = "0.3", default-features = false, features = ["events", "reminders"] }
+eventkit-rs = { version = "0.5", default-features = false, features = ["events", "reminders"] }
 ```
 
 ## Quick Start
@@ -101,12 +101,19 @@ tokio::spawn(async move {
 # MCP server (stdio transport)
 eventkit --mcp
 
+# Authorization status
+eventkit status
+eventkit status --events
+
 # Reminders
 eventkit reminders authorize
 eventkit reminders lists
 eventkit reminders list --all
 eventkit reminders add "Call mom" --notes "Birthday" --priority 1
+eventkit reminders show <id>
+eventkit reminders update <id> --title "Call mom back" --priority 1
 eventkit reminders complete <id>
+eventkit reminders uncomplete <id>
 eventkit reminders delete <id> --force
 
 # Calendar Events
@@ -116,6 +123,7 @@ eventkit events list --today
 eventkit events list --days 14 --all
 eventkit events add "Meeting" --start "2026-03-22 14:00" --duration 60
 eventkit events add "Holiday" --start "2026-03-25" --all-day
+eventkit events show <id>
 eventkit events delete <id> --force
 
 # Dump objects as JSON (for debugging)
