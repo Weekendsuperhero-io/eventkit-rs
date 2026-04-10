@@ -6,17 +6,9 @@
 //! This module is gated behind the `mcp` feature flag.
 
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServiceExt,
-    handler::server::{
-        router::{prompt::PromptRouter, tool::ToolRouter},
-        wrapper::Parameters,
-    },
-    model::*,
-    prompt, prompt_handler, prompt_router, schemars,
-    schemars::JsonSchema,
-    service::RequestContext,
-    tool, tool_handler, tool_router,
-    transport::stdio,
+    ErrorData as McpError, RoleServer, ServiceExt, handler::server::wrapper::Parameters, model::*,
+    prompt, prompt_handler, prompt_router, schemars, schemars::JsonSchema, service::RequestContext,
+    tool, tool_handler, tool_router, transport::stdio,
 };
 use serde::{Deserialize, Serialize};
 
@@ -859,8 +851,6 @@ pub struct CreateReminderPromptArgs {
 /// Note: EventKit managers are created fresh in each tool call as they are not Send+Sync
 #[derive(Clone)]
 pub struct EventKitServer {
-    tool_router: ToolRouter<Self>,
-    prompt_router: PromptRouter<Self>,
     /// Limits concurrent EventKit access to 1 at a time, since EventKit is !Send+!Sync
     concurrency: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -899,8 +889,6 @@ fn parse_datetime(s: &str) -> Result<DateTime<Local>, String> {
 impl EventKitServer {
     pub fn new() -> Self {
         Self {
-            tool_router: Self::tool_router(),
-            prompt_router: Self::prompt_router(),
             concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
