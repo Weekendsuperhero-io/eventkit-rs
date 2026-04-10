@@ -1,104 +1,13 @@
-# CI — runs on push/PR to main
-#
-# Run locally before pushing:
-#   cargo fmt --all                                          # fix formatting
-#   cargo clippy --all-targets --all-features --fix --allow-dirty  # fix lint warnings
-#   cargo test --all-features                                # run tests
-#
-# Check only (same as CI, no modifications):
-#   cargo fmt --all -- --check
-#   cargo clippy --all-targets --all-features -- -D warnings
-
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  check:
-    name: Check
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.94
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Build
-        run: cargo build --all-features
-
-      - name: Run tests
-        run: cargo test --all-features
-
-  build:
-    name: Build (${{ matrix.target }})
-    runs-on: macos-26
-    strategy:
-      matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.94
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
-
-      - name: Build for ${{ matrix.target }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-  docs:
-    name: Documentation
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.94
-
-      - name: Build documentation
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
+  ci:
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-rust-ci.yml@main
+    with:
+      check-os-json: '["macos-26"]'
+      rust-cache-provider: github
+      docs-os: macos-26
+      build-matrix-json: >-
+        [
+          {"os":"macos-26","target":"x86_64-apple-darwin"},
+          {"os":"macos-26","target":"aarch64-apple-darwin"ß}
+        ]
+    secrets: inherit
