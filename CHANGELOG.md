@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **PR description workflow** — introduced a new GitHub Actions workflow to automatically update PR descriptions on open and edit events.
+
+### Changed
+- **Cross-platform compilation** — moved `objc2`/`EventKit` dependencies behind `cfg(target_os = "macos")` and split source into platform-gated modules so the crate compiles as an empty shell on non-macOS platforms.
+- **Dependencies** — updated `tokio` to 1.51, bumped `rmcp` to 1.3 for the latest MCP protocol features, and updated Cargo lockfile.
+- **Project cleanup** — reorganized `Cargo.toml` metadata and features, replaced explicit closures with function pointers, and added clippy annotations for better maintainability.
+- **Tracing logs** — implemented lighter logging for tracing.
+- **CI/CD workflows** — updated the workflow strategy for universal builds.
+
+### Fixed
+- **Schema generation** — resolved stderr noise during schema generation by explicitly mapping Rust types (`usize`, `u8`) to standard schemars types.
+- **CI/CD workflows** — fixed GitHub Actions workflow and release job yaml configurations.
+
 ## [0.2.0] - 2025-02-10
 
 ### Added
