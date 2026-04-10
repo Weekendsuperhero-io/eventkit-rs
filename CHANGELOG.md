@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Dependencies** — bumped `rmcp` to v1.4 and refactored the codebase to accommodate new macro and async transport usage.
+- **Documentation** — refreshed project documentation in `README.md`.
+
 ### Added
 - **PR description workflow** — introduced a new GitHub Actions workflow to automatically update PR descriptions on open and edit events.
 
