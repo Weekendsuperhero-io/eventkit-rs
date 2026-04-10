@@ -1,0 +1,16 @@
+name: Update Changelog
+
+on:
+  workflow_dispatch: # manual trigger
+  # schedule:
+  #   - cron: "0 0 * * 1"  # every Monday (optional)
+
+jobs:
+  changelog:
+    permissions:
+      contents: write
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-changelog.yml@main
+    with:
+      changelog-path: CHANGELOG.md
+      pr-branch-prefix: "chore/changelog-"
+    secrets: inherit
