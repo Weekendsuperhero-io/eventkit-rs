@@ -9,6 +9,4 @@ jobs:
     uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-description.yml@main
     with:
       trigger-phrase: "@agent pr-title" # optional — only runs if this phrase is in the PR body
-    secrets:
-      JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    secrets: inherit
