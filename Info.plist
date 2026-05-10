@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>io.weekendsuperhero.eventkit</string>
+    <key>CFBundleName</key>
+    <string>eventkit</string>
+    <key>CFBundleDisplayName</key>
+    <string>eventkit</string>
+    <key>CFBundleExecutable</key>
+    <string>eventkit</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>eventkit accesses your Reminders to list, create, update, and delete them on your behalf.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>eventkit accesses your Calendar to list, create, update, and delete events on your behalf.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>eventkit uses your location when creating location-based reminders.</string>
+</dict>
+</plist>

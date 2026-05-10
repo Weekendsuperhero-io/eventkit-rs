@@ -12,7 +12,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{EventsManager, RemindersManager};
+use crate::{AuthorizationStatus, EventsManager, RemindersManager};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone};
 
 use rmcp::handler::server::wrapper::Json;
@@ -22,8 +22,35 @@ use rmcp::handler::server::wrapper::Json;
 // ============================================================================
 
 /// Convert an EventKitError into an McpError for tool returns.
+///
+/// Authorization variants get expanded with a remediation hint so the agent
+/// can guide the user to fix the underlying TCC state.
 fn mcp_err(e: &crate::EventKitError) -> McpError {
-    McpError::internal_error(e.to_string(), None)
+    use crate::EventKitError::*;
+    let msg = match e {
+        AuthorizationDenied => {
+            "Reminders/Calendar access denied. Open System Settings → Privacy & Security \
+             and enable access for `eventkit`. If `eventkit` is not listed, run \
+             `tccutil reset Reminders` (or Calendar) in a terminal and retry. \
+             Call `auth_status` to see the current state."
+                .to_string()
+        }
+        AuthorizationRestricted => {
+            "Reminders/Calendar access is restricted by system policy (MDM or parental controls)."
+                .to_string()
+        }
+        AuthorizationNotDetermined => {
+            "Authorization is undetermined and the consent dialog did not fire. \
+             The binary may be missing Info.plist usage strings — rebuild and retry. \
+             Call `auth_status` to see the current state."
+                .to_string()
+        }
+        AuthorizationRequestFailed(detail) => {
+            format!("Authorization request failed: {detail}")
+        }
+        _ => e.to_string(),
+    };
+    McpError::internal_error(msg, None)
 }
 
 fn mcp_invalid(msg: impl std::fmt::Display) -> McpError {
@@ -73,6 +100,62 @@ struct SearchResponse {
 struct CoordinateOutput {
     latitude: f64,
     longitude: f64,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct AuthStatusOutput {
+    /// One of: "FullAccess", "WriteOnly", "Denied", "NotDetermined", "Restricted"
+    reminders: &'static str,
+    /// One of: "FullAccess", "WriteOnly", "Denied", "NotDetermined", "Restricted"
+    events: &'static str,
+    /// Human-readable next step. Absent when both statuses are FullAccess/WriteOnly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remediation: Option<String>,
+}
+
+fn auth_status_str(s: AuthorizationStatus) -> &'static str {
+    match s {
+        AuthorizationStatus::NotDetermined => "NotDetermined",
+        AuthorizationStatus::Restricted => "Restricted",
+        AuthorizationStatus::Denied => "Denied",
+        AuthorizationStatus::FullAccess => "FullAccess",
+        AuthorizationStatus::WriteOnly => "WriteOnly",
+    }
+}
+
+fn auth_remediation(reminders: AuthorizationStatus, events: AuthorizationStatus) -> Option<String> {
+    let granted = |s| matches!(s, AuthorizationStatus::FullAccess | AuthorizationStatus::WriteOnly);
+    if granted(reminders) && granted(events) {
+        return None;
+    }
+    let worst = |s| match s {
+        AuthorizationStatus::Denied => 3,
+        AuthorizationStatus::Restricted => 2,
+        AuthorizationStatus::NotDetermined => 1,
+        _ => 0,
+    };
+    let pick = if worst(reminders) >= worst(events) { reminders } else { events };
+    Some(match pick {
+        AuthorizationStatus::NotDetermined => {
+            "Call any reminders or calendar tool to trigger the macOS consent dialog. \
+             If no dialog appears, the binary is missing its Info.plist usage strings — \
+             rebuild from a version that embeds them."
+                .into()
+        }
+        AuthorizationStatus::Denied => {
+            "Open System Settings → Privacy & Security → Reminders (and/or Calendar) and \
+             enable access for `eventkit`. If `eventkit` is not listed, run \
+             `tccutil reset Reminders` (or `tccutil reset Calendar`) in a terminal and \
+             retry — that clears the cached denial so the consent dialog can fire again."
+                .into()
+        }
+        AuthorizationStatus::Restricted => {
+            "Access is blocked by an MDM or parental-controls policy. The user cannot \
+             override this from System Settings — an administrator must change the policy."
+                .into()
+        }
+        _ => "Authorization is partially granted; one of reminders/events is not in FullAccess/WriteOnly state.".into(),
+    })
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -847,13 +930,11 @@ pub struct CreateReminderPromptArgs {
 // EventKit MCP Server
 // ============================================================================
 
-/// EventKit MCP Server - provides access to macOS Calendar and Reminders
-/// Note: EventKit managers are created fresh in each tool call as they are not Send+Sync
-#[derive(Clone)]
-pub struct EventKitServer {
-    /// Limits concurrent EventKit access to 1 at a time, since EventKit is !Send+!Sync
-    concurrency: std::sync::Arc<tokio::sync::Semaphore>,
-}
+/// EventKit MCP Server - provides access to macOS Calendar and Reminders.
+///
+/// EventKit objects are `!Send + !Sync`, so this server uses rmcp's `local`
+/// feature (non-`Send` futures) and must run on a current-thread tokio runtime.
+pub struct EventKitServer {}
 
 impl Default for EventKitServer {
     fn default() -> Self {
@@ -888,9 +969,24 @@ fn parse_datetime(s: &str) -> Result<DateTime<Local>, String> {
 #[tool_router]
 impl EventKitServer {
     pub fn new() -> Self {
-        Self {
-            concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-        }
+        Self {}
+    }
+
+    // ========================================================================
+    // Authorization
+    // ========================================================================
+
+    #[tool(
+        description = "Check macOS permission status for Reminders and Calendar without requesting access. Use this to diagnose authorization problems before calling other tools — it never triggers a consent dialog."
+    )]
+    async fn auth_status(&self) -> Result<Json<AuthStatusOutput>, McpError> {
+        let reminders = RemindersManager::authorization_status();
+        let events = EventsManager::authorization_status();
+        Ok(Json(AuthStatusOutput {
+            reminders: auth_status_str(reminders),
+            events: auth_status_str(events),
+            remediation: auth_remediation(reminders, events),
+        }))
     }
 
     // ========================================================================
@@ -899,7 +995,6 @@ impl EventKitServer {
 
     #[tool(description = "List all reminder lists (calendars) available in macOS Reminders.")]
     async fn list_reminder_lists(&self) -> Result<Json<ListResponse<CalendarOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.list_calendars() {
             Ok(lists) => {
@@ -920,7 +1015,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ListRemindersRequest>,
     ) -> Result<Json<ListResponse<ReminderOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         let reminders = if params.show_completed {
@@ -959,7 +1053,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateReminderRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         // Validate the list exists
@@ -1039,7 +1132,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<UpdateReminderRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         // Parse due date: Some("") means clear, Some(date) means set, None means no change
@@ -1134,7 +1226,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
     ) -> Result<Json<CalendarOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.create_calendar(&params.name) {
             Ok(cal) => Ok(Json(CalendarOutput::from_info(&cal))),
@@ -1147,7 +1238,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<UpdateReminderListRequest>,
     ) -> Result<Json<CalendarOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         let color_rgba = params.color.as_ref().map(CalendarColor::to_rgba);
         match manager.update_calendar(&params.list_id, params.name.as_deref(), color_rgba) {
@@ -1163,7 +1253,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<DeleteReminderListRequest>,
     ) -> Result<Json<DeletedResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.delete_calendar(&params.list_id) {
             Ok(_) => Ok(Json(DeletedResponse { id: params.list_id })),
@@ -1176,7 +1265,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.complete_reminder(&params.reminder_id) {
             Ok(_) => {
@@ -1195,7 +1283,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.uncomplete_reminder(&params.reminder_id) {
             Ok(_) => {
@@ -1214,7 +1301,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.get_reminder(&params.reminder_id) {
             Ok(r) => Ok(Json(ReminderOutput::from_item(&r, &manager))),
@@ -1227,7 +1313,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
     ) -> Result<Json<DeletedResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.delete_reminder(&params.reminder_id) {
             Ok(_) => Ok(Json(DeletedResponse {
@@ -1243,7 +1328,6 @@ impl EventKitServer {
 
     #[tool(description = "List all calendars available in macOS Calendar app.")]
     async fn list_calendars(&self) -> Result<Json<ListResponse<CalendarOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.list_calendars() {
             Ok(cals) => {
@@ -1264,7 +1348,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<ListEventsRequest>,
     ) -> Result<Json<ListResponse<EventOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let events = if params.days == 1 {
@@ -1305,7 +1388,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateEventRequest>,
     ) -> Result<Json<EventOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let start = match parse_datetime(&params.start) {
@@ -1368,7 +1450,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<EventIdRequest>,
     ) -> Result<Json<DeletedResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.delete_event(&params.event_id, params.affect_future) {
             Ok(_) => Ok(Json(DeletedResponse {
@@ -1383,7 +1464,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<EventIdRequest>,
     ) -> Result<Json<EventOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.get_event(&params.event_id) {
             Ok(e) => Ok(Json(EventOutput::from_item(&e, &manager))),
@@ -1400,7 +1480,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
     ) -> Result<Json<CalendarOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.create_event_calendar(&params.name) {
             Ok(cal) => Ok(Json(CalendarOutput::from_info(&cal))),
@@ -1413,7 +1492,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<UpdateEventCalendarRequest>,
     ) -> Result<Json<CalendarOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let color_rgba = params.color.as_ref().map(CalendarColor::to_rgba);
@@ -1432,7 +1510,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<DeleteReminderListRequest>,
     ) -> Result<Json<DeletedResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
         match manager.delete_event_calendar(&params.list_id) {
             Ok(()) => Ok(Json(DeletedResponse { id: params.list_id })),
@@ -1446,7 +1523,6 @@ impl EventKitServer {
 
     #[tool(description = "List all available sources (accounts like iCloud, Local, Exchange).")]
     async fn list_sources(&self) -> Result<Json<ListResponse<SourceOutput>>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         match manager.list_sources() {
             Ok(sources) => {
@@ -1471,7 +1547,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<UpdateEventRequest>,
     ) -> Result<Json<EventOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = EventsManager::new();
 
         let start = match params.start.as_ref().map(|s| parse_datetime(s)).transpose() {
@@ -1523,7 +1598,6 @@ impl EventKitServer {
         description = "Get the user's current location (latitude, longitude). Requires location permission."
     )]
     async fn get_current_location(&self) -> Result<Json<CoordinateOutput>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = crate::location::LocationManager::new();
         match manager.get_current_location(std::time::Duration::from_secs(10)) {
             Ok(coord) => Ok(Json(CoordinateOutput {
@@ -1544,7 +1618,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<SearchRequest>,
     ) -> Result<Json<SearchResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let query = params.query.to_lowercase();
 
         let search_reminders = matches!(params.item_type, None | Some(ItemType::Reminder));
@@ -1617,7 +1690,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<BatchDeleteRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let mut succeeded = 0usize;
         let mut errors = Vec::new();
 
@@ -1665,7 +1737,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<BatchMoveRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         let mut succeeded = 0usize;
         let mut errors = Vec::new();
@@ -1709,7 +1780,6 @@ impl EventKitServer {
         &self,
         Parameters(params): Parameters<BatchUpdateRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let mut succeeded = 0usize;
         let mut errors = Vec::new();
 
@@ -1952,7 +2022,6 @@ impl EventKitServer {
         &self,
         Parameters(args): Parameters<ListRemindersPromptArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         let reminders = manager.fetch_incomplete_reminders().map_err(|e| {
             McpError::internal_error(format!("Failed to list reminders: {e}"), None)
@@ -2004,7 +2073,6 @@ impl EventKitServer {
         description = "List all reminder lists available in Reminders"
     )]
     async fn reminder_lists_prompt(&self) -> Result<GetPromptResult, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
         let lists = manager.list_calendars().map_err(|e| {
             McpError::internal_error(format!("Failed to list calendars: {e}"), None)
@@ -2037,7 +2105,6 @@ impl EventKitServer {
         &self,
         Parameters(args): Parameters<MoveReminderPromptArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         // Find the destination calendar
@@ -2102,7 +2169,6 @@ impl EventKitServer {
         &self,
         Parameters(args): Parameters<CreateReminderPromptArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let _permit = self.concurrency.acquire().await.unwrap();
         let manager = RemindersManager::new();
 
         let due = args
@@ -2268,4 +2334,109 @@ pub fn dump_sources() -> Result<String, crate::EventKitError> {
     let sources = manager.list_sources()?;
     let output: Vec<_> = sources.iter().map(SourceOutput::from_info).collect();
     Ok(serde_json::to_string_pretty(&output).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EventKitError;
+
+    #[test]
+    fn auth_status_str_covers_every_variant() {
+        // Update this whenever AuthorizationStatus gains a variant — that's
+        // the whole point: a new variant breaks compilation here, and the
+        // MCP `auth_status` response stays in sync with the source enum.
+        for s in [
+            AuthorizationStatus::NotDetermined,
+            AuthorizationStatus::Restricted,
+            AuthorizationStatus::Denied,
+            AuthorizationStatus::FullAccess,
+            AuthorizationStatus::WriteOnly,
+        ] {
+            let str_form = auth_status_str(s);
+            assert!(!str_form.is_empty(), "empty string for {s:?}");
+            assert!(
+                !str_form.contains(' '),
+                "MCP wire format should be PascalCase, got {str_form:?} for {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_remediation_absent_when_both_granted() {
+        for r in [AuthorizationStatus::FullAccess, AuthorizationStatus::WriteOnly] {
+            for e in [AuthorizationStatus::FullAccess, AuthorizationStatus::WriteOnly] {
+                assert!(
+                    auth_remediation(r, e).is_none(),
+                    "expected no remediation for ({r:?}, {e:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auth_remediation_picks_worst_status() {
+        // Denied (3) > Restricted (2) > NotDetermined (1) > granted (0).
+        // When reminders=NotDetermined and events=Denied, hint should reflect
+        // the Denied state.
+        let hint = auth_remediation(
+            AuthorizationStatus::NotDetermined,
+            AuthorizationStatus::Denied,
+        )
+        .expect("expected remediation");
+        assert!(
+            hint.contains("System Settings") || hint.contains("tccutil"),
+            "Denied remediation should mention System Settings or tccutil; got: {hint}"
+        );
+    }
+
+    #[test]
+    fn auth_remediation_notdetermined_mentions_consent_dialog() {
+        let hint = auth_remediation(
+            AuthorizationStatus::NotDetermined,
+            AuthorizationStatus::NotDetermined,
+        )
+        .expect("expected remediation");
+        assert!(
+            hint.contains("consent dialog"),
+            "NotDetermined remediation should mention the consent dialog; got: {hint}"
+        );
+    }
+
+    #[test]
+    fn mcp_err_includes_remediation_hint_for_auth_variants() {
+        // The plain error message is just "Authorization denied"; mcp_err
+        // wraps it with actionable guidance for the agent. If this test
+        // breaks, the agent loses its diagnostic hint.
+        let err = mcp_err(&EventKitError::AuthorizationDenied);
+        assert!(
+            err.message.contains("System Settings") && err.message.contains("auth_status"),
+            "AuthorizationDenied should mention System Settings and the auth_status tool; got: {}",
+            err.message
+        );
+
+        let err = mcp_err(&EventKitError::AuthorizationNotDetermined);
+        assert!(
+            err.message.contains("Info.plist"),
+            "AuthorizationNotDetermined should hint at Info.plist usage strings; got: {}",
+            err.message
+        );
+
+        let err = mcp_err(&EventKitError::AuthorizationRestricted);
+        assert!(
+            err.message.contains("MDM") || err.message.contains("policy"),
+            "AuthorizationRestricted should mention policy/MDM; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn mcp_err_passes_through_non_auth_errors() {
+        let err = mcp_err(&EventKitError::ItemNotFound("xyz".into()));
+        assert!(
+            err.message.contains("xyz"),
+            "non-auth errors should preserve the original message; got: {}",
+            err.message
+        );
+    }
 }

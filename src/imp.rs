@@ -1396,7 +1396,7 @@ impl EventsManager {
         }
 
         // Sort by start date
-        items.sort_by(|a, b| a.start_date.cmp(&b.start_date));
+        items.sort_by_key(|a| a.start_date);
 
         Ok(items)
     }

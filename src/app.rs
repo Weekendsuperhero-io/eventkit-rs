@@ -251,8 +251,14 @@ pub fn run() {
     // Handle --mcp flag
     #[cfg(feature = "mcp")]
     if cli.mcp {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        if let Err(e) = rt.block_on(eventkit::mcp::run_mcp_server()) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        // rmcp's `local` feature uses spawn_local internally, which requires a
+        // LocalSet wrapper around the runtime entry point.
+        let local = tokio::task::LocalSet::new();
+        if let Err(e) = local.block_on(&rt, eventkit::mcp::run_mcp_server()) {
             eprintln!("MCP server error: {}", e);
             std::process::exit(1);
         }

@@ -1,0 +1,27 @@
+# cargo-nextest configuration. Run with: `cargo nextest run`.
+
+[profile.default]
+# Fail-fast off so a flaky EventKit test doesn't hide unrelated breakage.
+fail-fast = false
+# Most tests are pure or stub the binary; keep this tight so a hang surfaces
+# as a failure instead of stalling the whole suite.
+slow-timeout = { period = "10s", terminate-after = 2 }
+
+# CI profile mirrors default but with stricter terminate behavior. Run with:
+# `cargo nextest run --profile ci`
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "30s", terminate-after = 2 }
+retries = 0
+
+# Tests that touch live EventKit state (real authorization, real reads/writes)
+# go in this group. They are #[ignore]d by default — run explicitly with
+# `cargo nextest run --run-ignored only`.
+[[profile.default.overrides]]
+filter = "test(live_eventkit)"
+test-group = "live-eventkit"
+
+# `live-eventkit` runs serially: only one EKEventStore mutation flow at a time
+# and at most one TCC consent dialog can be active.
+[test-groups]
+live-eventkit = { max-threads = 1 }
