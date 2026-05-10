@@ -124,7 +124,12 @@ fn auth_status_str(s: AuthorizationStatus) -> &'static str {
 }
 
 fn auth_remediation(reminders: AuthorizationStatus, events: AuthorizationStatus) -> Option<String> {
-    let granted = |s| matches!(s, AuthorizationStatus::FullAccess | AuthorizationStatus::WriteOnly);
+    let granted = |s| {
+        matches!(
+            s,
+            AuthorizationStatus::FullAccess | AuthorizationStatus::WriteOnly
+        )
+    };
     if granted(reminders) && granted(events) {
         return None;
     }
@@ -134,7 +139,11 @@ fn auth_remediation(reminders: AuthorizationStatus, events: AuthorizationStatus)
         AuthorizationStatus::NotDetermined => 1,
         _ => 0,
     };
-    let pick = if worst(reminders) >= worst(events) { reminders } else { events };
+    let pick = if worst(reminders) >= worst(events) {
+        reminders
+    } else {
+        events
+    };
     Some(match pick {
         AuthorizationStatus::NotDetermined => {
             "Call any reminders or calendar tool to trigger the macOS consent dialog. \
@@ -2364,8 +2373,14 @@ mod tests {
 
     #[test]
     fn auth_remediation_absent_when_both_granted() {
-        for r in [AuthorizationStatus::FullAccess, AuthorizationStatus::WriteOnly] {
-            for e in [AuthorizationStatus::FullAccess, AuthorizationStatus::WriteOnly] {
+        for r in [
+            AuthorizationStatus::FullAccess,
+            AuthorizationStatus::WriteOnly,
+        ] {
+            for e in [
+                AuthorizationStatus::FullAccess,
+                AuthorizationStatus::WriteOnly,
+            ] {
                 assert!(
                     auth_remediation(r, e).is_none(),
                     "expected no remediation for ({r:?}, {e:?})"

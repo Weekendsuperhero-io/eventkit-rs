@@ -40,7 +40,12 @@ impl McpClient {
             .expect("failed to spawn eventkit --mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self { child, stdin, stdout, next_id: 0 }
+        Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 0,
+        }
     }
 
     fn send(&mut self, msg: &Value) {
@@ -61,9 +66,8 @@ impl McpClient {
             if n == 0 {
                 panic!("MCP server closed stdout before response id={id}");
             }
-            let v: Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
-                panic!("non-JSON line from MCP server: {line:?} ({e})")
-            });
+            let v: Value = serde_json::from_str(line.trim())
+                .unwrap_or_else(|e| panic!("non-JSON line from MCP server: {line:?} ({e})"));
             if v.get("id").and_then(Value::as_i64) == Some(id) {
                 return v;
             }
@@ -93,7 +97,10 @@ impl McpClient {
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}));
         let resp = self.recv_response(id, Duration::from_secs(5));
-        resp["result"]["tools"].as_array().expect("tools array").clone()
+        resp["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .clone()
     }
 
     fn call_tool(&mut self, name: &str, args: Value) -> Value {
@@ -160,11 +167,17 @@ fn mcp_auth_status_returns_valid_structured_response() {
         structured.is_object(),
         "auth_status missing structuredContent: {resp}"
     );
-    let valid = ["FullAccess", "WriteOnly", "Denied", "NotDetermined", "Restricted"];
+    let valid = [
+        "FullAccess",
+        "WriteOnly",
+        "Denied",
+        "NotDetermined",
+        "Restricted",
+    ];
     for field in ["reminders", "events"] {
-        let v = structured[field].as_str().unwrap_or_else(|| {
-            panic!("auth_status.{field} missing or not a string: {structured}")
-        });
+        let v = structured[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("auth_status.{field} missing or not a string: {structured}"));
         assert!(
             valid.contains(&v),
             "auth_status.{field} has unexpected value {v:?}; want one of {valid:?}"
