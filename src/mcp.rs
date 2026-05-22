@@ -941,8 +941,13 @@ pub struct CreateReminderPromptArgs {
 
 /// EventKit MCP Server - provides access to macOS Calendar and Reminders.
 ///
-/// EventKit objects are `!Send + !Sync`, so this server uses rmcp's `local`
-/// feature (non-`Send` futures) and must run on a current-thread tokio runtime.
+/// EventKit objects (`Retained<EKEventStore>` and its managers) are `!Send + !Sync`,
+/// but every handler in this module keeps those values stack-local and never holds
+/// one across an `.await`. That makes the generated handler futures `Send`, so the
+/// server can run on a normal multi-thread tokio runtime without rmcp's `local`
+/// feature. New handlers MUST preserve this invariant — if you need async work,
+/// wrap the synchronous EventKit calls in `tokio::task::spawn_blocking` so the
+/// `!Send` value lives entirely inside the blocking closure.
 pub struct EventKitServer {}
 
 impl Default for EventKitServer {

@@ -2,8 +2,8 @@
 //! drive it over JSON-RPC on stdio, the same way a real MCP client would.
 //!
 //! These catch the class of bug that unit tests miss: runtime configuration
-//! issues (e.g. `spawn_local` outside a `LocalSet`), tool registration
-//! regressions, JSON shape regressions in tool responses.
+//! issues, tool registration regressions, JSON shape regressions in tool
+//! responses.
 //!
 //! Only `auth_status` is exercised end-to-end here — it's the one tool that
 //! never triggers a TCC dialog or mutates state, so it's safe to run in CI
@@ -128,9 +128,6 @@ impl Drop for McpClient {
 
 #[test]
 fn mcp_initialize_and_list_tools_does_not_panic() {
-    // This is the regression test for the `spawn_local called from outside of
-    // a task::LocalSet` panic that broke `tools/list` after the !Send/local
-    // migration. The bare current-thread runtime needs a `LocalSet` wrapper.
     let mut c = McpClient::spawn();
     c.initialize();
     let tools = c.list_tools();
@@ -191,9 +188,6 @@ fn mcp_auth_status_returns_valid_structured_response() {
 
 #[test]
 fn mcp_handles_multiple_sequential_requests_without_panic() {
-    // The original spawn_local panic only fired on the *second* JSON-RPC
-    // message — initialize succeeded, then the next request panicked the
-    // server thread. This test guards that exact regression.
     let mut c = McpClient::spawn();
     c.initialize();
     let _ = c.list_tools();
