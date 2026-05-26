@@ -1,4 +1,4 @@
-use chrono::{Duration, Local, NaiveDateTime, TimeZone};
+use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone};
 use clap::{Parser, Subcommand};
 use eventkit::{AuthorizationStatus, EventKitError, EventsManager, RemindersManager};
 
@@ -39,6 +39,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+#[allow(non_snake_case)]
 enum RemindersCommands {
     /// Request authorization to access reminders
     Authorize,
@@ -67,6 +68,25 @@ enum RemindersCommands {
         /// Show all fields for debugging
         #[arg(long)]
         debug: bool,
+
+        /// Filter incomplete reminders to those due at/after this timestamp
+        /// (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`).
+        #[arg(long = "due-after")]
+        due_after: Option<String>,
+
+        /// Filter incomplete reminders to those due before this timestamp.
+        #[arg(long = "due-before")]
+        due_before: Option<String>,
+
+        /// Filter to completed reminders completed at/after this timestamp.
+        /// Implies completed-only.
+        #[arg(long = "completed-after")]
+        completed_after: Option<String>,
+
+        /// Filter to completed reminders completed before this timestamp.
+        /// Implies completed-only.
+        #[arg(long = "completed-before")]
+        completed_before: Option<String>,
     },
 
     /// Create a new reminder
@@ -85,6 +105,10 @@ enum RemindersCommands {
         /// Priority (0=none, 1-4=high, 5=medium, 6-9=low)
         #[arg(short, long)]
         priority: Option<usize>,
+
+        /// IANA timezone for the due date (e.g. America/Los_Angeles)
+        #[arg(long = "due-tz")]
+        due_tz: Option<String>,
     },
 
     /// Update an existing reminder
@@ -103,7 +127,55 @@ enum RemindersCommands {
         /// Priority (0=none, 1-4=high, 5=medium, 6-9=low)
         #[arg(short, long)]
         priority: Option<usize>,
+
+        /// Explicit completion timestamp. Setting marks the reminder
+        /// complete; pass an empty string to clear (marks incomplete).
+        /// Format: `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`.
+        #[arg(long = "completion-date")]
+        completion_date: Option<String>,
     },
+
+    /// Set or clear the IANA timezone applied specifically to the due date.
+    SetDueTz {
+        id: String,
+        /// IANA zone name, e.g. America/Los_Angeles (use "" to clear)
+        tz: String,
+    },
+
+    /// Diagnostic: set or clear `EKReminder.URL`. Reminders.app's UI typically
+    /// ignores this field on iCloud-synced reminders (see project notes), but
+    /// the setter still writes to EventKit for inspection / CalDAV consumers.
+    #[command(name = "set-URL")]
+    #[allow(non_camel_case_types)]
+    SetURL {
+        id: String,
+        /// New URL (use "" to clear). Strictly validated per RFC 3986.
+        #[allow(non_snake_case)]
+        URL: String,
+    },
+
+    /// Attach a geofence ("remind me when I arrive/leave") to a reminder by
+    /// adding a location-based alarm. Triggers the Location permission
+    /// prompt the first time it's used.
+    SetGeofence {
+        id: String,
+        /// Display title for the location ("Home", "Office", ...)
+        #[arg(long = "loc-title")]
+        title: String,
+        #[arg(long)]
+        lat: f64,
+        #[arg(long)]
+        lng: f64,
+        /// Radius in meters.
+        #[arg(long, default_value = "100")]
+        radius: f64,
+        /// "enter" or "leave".
+        #[arg(long, default_value = "enter")]
+        proximity: String,
+    },
+
+    /// Clear any geofence-bearing alarm from the reminder.
+    ClearGeofence { id: String },
 
     /// Mark a reminder as complete
     Complete {
@@ -193,6 +265,62 @@ enum EventsCommands {
         /// Create as all-day event
         #[arg(long)]
         all_day: bool,
+
+        /// URL to associate with the event
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Availability: busy (default), free, tentative, unavailable
+        #[arg(long)]
+        availability: Option<String>,
+    },
+
+    /// Update an existing event. Any field you don't supply is left as-is.
+    /// Use `--span future` to propagate the edit to all later occurrences
+    /// in a recurring series.
+    Update {
+        /// Identifier of the event to update
+        id: String,
+
+        /// New title
+        #[arg(long)]
+        title: Option<String>,
+
+        /// New notes (use "" to clear)
+        #[arg(long)]
+        notes: Option<String>,
+
+        /// New location (use "" to clear)
+        #[arg(long)]
+        location: Option<String>,
+
+        /// New start (YYYY-MM-DD or YYYY-MM-DD HH:MM)
+        #[arg(long)]
+        start: Option<String>,
+
+        /// New end (YYYY-MM-DD or YYYY-MM-DD HH:MM)
+        #[arg(long)]
+        end: Option<String>,
+
+        /// Toggle all-day on / off
+        #[arg(long)]
+        all_day: Option<bool>,
+
+        /// Move to another calendar by name
+        #[arg(long)]
+        calendar: Option<String>,
+
+        /// New URL (use "" to clear)
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Availability: busy | free | tentative | unavailable
+        #[arg(long)]
+        availability: Option<String>,
+
+        /// Edit scope for recurring events: "this" (default) or "future"
+        #[arg(long, default_value = "this")]
+        span: String,
     },
 
     /// Delete an event
@@ -203,6 +331,10 @@ enum EventsCommands {
         /// Skip confirmation
         #[arg(short, long)]
         force: bool,
+
+        /// Edit scope for recurring events: "this" (default) or "future"
+        #[arg(long, default_value = "this")]
+        span: String,
     },
 
     /// Show details of a specific event
@@ -217,6 +349,27 @@ enum EventsCommands {
 enum DumpCommands {
     /// Dump a single reminder with all fields, alarms, recurrence as JSON
     Reminder {
+        /// Identifier of the reminder
+        id: String,
+    },
+    /// Dump every native Objective-C `@property` on a reminder (and its
+    /// calendar + source) using runtime reflection. Use this to discover
+    /// EventKit fields that aren't yet surfaced by the curated `ReminderItem`.
+    ReminderRaw {
+        /// Identifier of the reminder
+        id: String,
+
+        /// Also read each property's current value via KVC. May surface
+        /// NSExceptions for some keys; a small denylist skips keys known
+        /// to abort the process via C asserts (e.g. `objectID`).
+        #[arg(long)]
+        values: bool,
+    },
+    /// Probe a curated list of suspected-private selectors on a reminder
+    /// (`richLink`, `tags`, `structuredData`, …). Read-only — useful for
+    /// finding where Reminders.app stores its UI rich-link URL and
+    /// first-class tag entities that the public EventKit API doesn't surface.
+    ReminderPrivate {
         /// Identifier of the reminder
         id: String,
     },
@@ -283,23 +436,62 @@ pub fn run() {
                 completed,
                 all,
                 debug,
-            } => cmd_reminders_list(list, incomplete, completed, all, debug),
+                due_after,
+                due_before,
+                completed_after,
+                completed_before,
+            } => cmd_reminders_list(
+                list,
+                incomplete,
+                completed,
+                all,
+                debug,
+                due_after.as_deref(),
+                due_before.as_deref(),
+                completed_after.as_deref(),
+                completed_before.as_deref(),
+            ),
             RemindersCommands::Add {
                 title,
                 notes,
                 list,
                 priority,
-            } => cmd_reminders_add(&title, notes.as_deref(), list.as_deref(), priority),
+                due_tz,
+            } => cmd_reminders_add(
+                &title,
+                notes.as_deref(),
+                list.as_deref(),
+                priority,
+                due_tz.as_deref(),
+            ),
             RemindersCommands::Update {
                 id,
                 title,
                 notes,
                 priority,
-            } => cmd_reminders_update(&id, title.as_deref(), notes.as_deref(), priority),
+                completion_date,
+            } => cmd_reminders_update(
+                &id,
+                title.as_deref(),
+                notes.as_deref(),
+                priority,
+                completion_date.as_deref(),
+            ),
             RemindersCommands::Complete { id } => cmd_reminders_complete(&id),
             RemindersCommands::Uncomplete { id } => cmd_reminders_uncomplete(&id),
             RemindersCommands::Delete { id, force } => cmd_reminders_delete(&id, force),
             RemindersCommands::Show { id } => cmd_reminders_show(&id),
+            RemindersCommands::SetDueTz { id, tz } => cmd_reminders_set_due_tz(&id, &tz),
+            RemindersCommands::SetURL { id, URL } => cmd_reminders_set_URL(&id, &URL),
+            RemindersCommands::SetGeofence {
+                id,
+                title,
+                lat,
+                lng,
+                radius,
+                proximity,
+            } => cmd_reminders_set_geofence(&id, &title, lat, lng, radius, &proximity),
+            RemindersCommands::ClearGeofence { id } => cmd_reminders_clear_geofence(&id),
         },
         Commands::Events(cmd) => match cmd {
             EventsCommands::Authorize => cmd_events_authorize(),
@@ -319,6 +511,8 @@ pub fn run() {
                 location,
                 calendar,
                 all_day,
+                url,
+                availability,
             } => cmd_events_add(
                 &title,
                 &start,
@@ -328,8 +522,35 @@ pub fn run() {
                 location.as_deref(),
                 calendar.as_deref(),
                 all_day,
+                url.as_deref(),
+                availability.as_deref(),
             ),
-            EventsCommands::Delete { id, force } => cmd_events_delete(&id, force),
+            EventsCommands::Update {
+                id,
+                title,
+                notes,
+                location,
+                start,
+                end,
+                all_day,
+                calendar,
+                url,
+                availability,
+                span,
+            } => cmd_events_update(
+                &id,
+                title.as_deref(),
+                notes.as_deref(),
+                location.as_deref(),
+                start.as_deref(),
+                end.as_deref(),
+                all_day,
+                calendar.as_deref(),
+                url.as_deref(),
+                availability.as_deref(),
+                &span,
+            ),
+            EventsCommands::Delete { id, force, span } => cmd_events_delete(&id, force, &span),
             EventsCommands::Show { id } => cmd_events_show(&id),
         },
     };
@@ -437,21 +658,68 @@ fn cmd_reminders_lists() -> Result<(), EventKitError> {
     Ok(())
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn cmd_reminders_list(
     list_filter: Option<Vec<String>>,
     incomplete: bool,
     show_completed: bool,
     show_all: bool,
     debug: bool,
+    due_after: Option<&str>,
+    due_before: Option<&str>,
+    completed_after: Option<&str>,
+    completed_before: Option<&str>,
 ) -> Result<(), EventKitError> {
     let manager = RemindersManager::new();
 
-    let reminders = if incomplete {
-        manager.fetch_incomplete_reminders()?
-    } else if let Some(ref lists) = list_filter {
-        let list_refs: Vec<&str> = lists.iter().map(std::string::String::as_str).collect();
-        manager.fetch_reminders(Some(&list_refs))?
+    fn parse_cli_date(
+        label: &str,
+        s: Option<&str>,
+    ) -> Result<Option<DateTime<Local>>, EventKitError> {
+        match s {
+            None => Ok(None),
+            Some(raw) => {
+                // Reuse chrono parsing inline since cmd_status's helper isn't exported here.
+                if let Ok(naive) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M") {
+                    return Local
+                        .from_local_datetime(&naive)
+                        .single()
+                        .ok_or_else(|| EventKitError::SaveFailed(format!("Invalid {label}: {raw}")))
+                        .map(Some);
+                }
+                if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+                    let naive = date.and_hms_opt(0, 0, 0).unwrap();
+                    return Local
+                        .from_local_datetime(&naive)
+                        .single()
+                        .ok_or_else(|| EventKitError::SaveFailed(format!("Invalid {label}: {raw}")))
+                        .map(Some);
+                }
+                Err(EventKitError::SaveFailed(format!(
+                    "Invalid {label}: '{raw}'. Use YYYY-MM-DD or YYYY-MM-DD HH:MM."
+                )))
+            }
+        }
+    }
+    let due_after = parse_cli_date("--due-after", due_after)?;
+    let due_before = parse_cli_date("--due-before", due_before)?;
+    let completed_after = parse_cli_date("--completed-after", completed_after)?;
+    let completed_before = parse_cli_date("--completed-before", completed_before)?;
+
+    let list_owned = list_filter.clone();
+    let list_refs_storage: Option<Vec<&str>> = list_owned
+        .as_ref()
+        .map(|l| l.iter().map(std::string::String::as_str).collect());
+    let list_refs: Option<&[&str]> = list_refs_storage.as_deref();
+
+    let reminders = if completed_after.is_some() || completed_before.is_some() {
+        manager.fetch_completed_reminders_in_range(completed_after, completed_before, list_refs)?
+    } else if due_after.is_some() || due_before.is_some() {
+        manager.fetch_incomplete_reminders_in_due_range(due_after, due_before, list_refs)?
+    } else if incomplete {
+        manager.fetch_incomplete_reminders_in_due_range(None, None, list_refs)?
+    } else if let Some(refs) = list_refs {
+        manager.fetch_reminders(Some(refs))?
     } else {
         manager.fetch_all_reminders()?
     };
@@ -537,7 +805,7 @@ fn cmd_reminders_list(
             if let Some(ref location) = reminder.location {
                 println!("      Location: {}", location);
             }
-            if let Some(ref url) = reminder.url {
+            if let Some(ref url) = reminder.URL {
                 println!("      URL: {}", url);
             }
             if let Some(creation_date) = reminder.creation_date {
@@ -580,6 +848,7 @@ fn cmd_reminders_add(
     notes: Option<&str>,
     list: Option<&str>,
     priority: Option<usize>,
+    due_tz: Option<&str>,
 ) -> Result<(), EventKitError> {
     if let Some(p) = priority
         && p > 9
@@ -591,7 +860,14 @@ fn cmd_reminders_add(
     }
 
     let manager = RemindersManager::new();
-    let reminder = manager.create_reminder(title, notes, list, priority, None, None)?;
+    let reminder = manager.create_reminder(&eventkit::ReminderDraft {
+        title,
+        notes,
+        calendar_title: list,
+        priority,
+        due_date_timezone: due_tz,
+        ..Default::default()
+    })?;
 
     println!("✓ Created reminder: {}", reminder.title);
     println!("  ID: {}", reminder.identifier);
@@ -602,14 +878,83 @@ fn cmd_reminders_add(
     Ok(())
 }
 
+#[allow(non_snake_case)]
+fn cmd_reminders_set_URL(id: &str, url: &str) -> Result<(), EventKitError> {
+    let manager = RemindersManager::new();
+    let value = if url.is_empty() { None } else { Some(url) };
+    manager.set_URL(id, value)?;
+    println!(
+        "✓ {}",
+        if value.is_some() {
+            "Set URL"
+        } else {
+            "Cleared URL"
+        }
+    );
+    Ok(())
+}
+
+fn cmd_reminders_set_due_tz(id: &str, tz: &str) -> Result<(), EventKitError> {
+    let manager = RemindersManager::new();
+    let value = if tz.is_empty() { None } else { Some(tz) };
+    manager.set_due_date_timezone(id, value)?;
+    println!(
+        "✓ {}",
+        if value.is_some() {
+            "Set due-date timezone"
+        } else {
+            "Cleared due-date timezone"
+        }
+    );
+    Ok(())
+}
+
+fn cmd_reminders_set_geofence(
+    id: &str,
+    title: &str,
+    lat: f64,
+    lng: f64,
+    radius: f64,
+    proximity: &str,
+) -> Result<(), EventKitError> {
+    let proximity = match proximity.to_lowercase().as_str() {
+        "enter" | "arrive" | "arrival" => eventkit::AlarmProximity::Enter,
+        "leave" | "exit" | "departure" => eventkit::AlarmProximity::Leave,
+        other => {
+            eprintln!("--proximity must be 'enter' or 'leave', got {other:?}");
+            return Err(EventKitError::SaveFailed(
+                "Invalid proximity value".to_string(),
+            ));
+        }
+    };
+    let manager = RemindersManager::new();
+    let loc = eventkit::StructuredLocation {
+        title: title.to_string(),
+        latitude: lat,
+        longitude: lng,
+        radius,
+    };
+    manager.set_geofence(id, Some((&loc, proximity)))?;
+    println!("✓ Geofence set on {id}");
+    Ok(())
+}
+
+fn cmd_reminders_clear_geofence(id: &str) -> Result<(), EventKitError> {
+    let manager = RemindersManager::new();
+    manager.set_geofence(id, None)?;
+    println!("✓ Cleared geofence on {id}");
+    Ok(())
+}
+
 fn cmd_reminders_update(
     id: &str,
     title: Option<&str>,
     notes: Option<&str>,
     priority: Option<usize>,
+    completion_date: Option<&str>,
 ) -> Result<(), EventKitError> {
-    if title.is_none() && notes.is_none() && priority.is_none() {
-        eprintln!("No updates specified. Use --title, --notes, or --priority.");
+    if title.is_none() && notes.is_none() && priority.is_none() && completion_date.is_none() {
+        eprintln!("No updates specified. Use --title, --notes, --priority, or --completion-date.");
         return Ok(());
     }
 
@@ -622,8 +967,40 @@ fn cmd_reminders_update(
         ));
     }
 
+    // Parse completion_date the same way list filters do.
+    let completion_date_patch: Option<Option<DateTime<Local>>> = match completion_date {
+        None => None,
+        Some("") => Some(None),
+        Some(raw) => {
+            let naive = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M")
+                .or_else(|_| {
+                    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                        .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                })
+                .map_err(|_| {
+                    EventKitError::SaveFailed(format!(
+                        "Invalid --completion-date '{raw}'. Use YYYY-MM-DD or YYYY-MM-DD HH:MM."
+                    ))
+                })?;
+            let dt = Local
+                .from_local_datetime(&naive)
+                .single()
+                .ok_or_else(|| EventKitError::SaveFailed("Ambiguous local datetime".into()))?;
+            Some(Some(dt))
+        }
+    };
+
     let manager = RemindersManager::new();
-    let reminder = manager.update_reminder(id, title, notes, None, priority, None, None, None)?;
+    let reminder = manager.update_reminder(
+        id,
+        &eventkit::ReminderPatch {
+            title,
+            notes,
+            priority,
+            completion_date: completion_date_patch,
+            ..Default::default()
+        },
+    )?;
 
     println!("✓ Updated reminder: {}", reminder.title);
 
@@ -848,6 +1225,8 @@ fn cmd_events_add(
     location: Option<&str>,
     calendar: Option<&str>,
     all_day: bool,
+    url: Option<&str>,
+    availability: Option<&str>,
 ) -> Result<(), EventKitError> {
     let start = parse_datetime(start_str).ok_or_else(|| {
         EventKitError::SaveFailed(
@@ -867,8 +1246,33 @@ fn cmd_events_add(
         start + Duration::minutes(duration_mins)
     };
 
+    // Map --availability to enum at CLI boundary so errors land here.
+    let availability_enum = match availability {
+        None => None,
+        Some("busy") => Some(eventkit::EventAvailability::Busy),
+        Some("free") => Some(eventkit::EventAvailability::Free),
+        Some("tentative") => Some(eventkit::EventAvailability::Tentative),
+        Some("unavailable") => Some(eventkit::EventAvailability::Unavailable),
+        Some(other) => {
+            return Err(EventKitError::SaveFailed(format!(
+                "--availability must be busy|free|tentative|unavailable, got {other:?}"
+            )));
+        }
+    };
+
     let manager = EventsManager::new();
-    let event = manager.create_event(title, start, end, notes, location, calendar, all_day)?;
+    let event = manager.create_event(&eventkit::EventDraft {
+        title,
+        start: Some(start),
+        end: Some(end),
+        notes,
+        location,
+        calendar_title: calendar,
+        all_day,
+        URL: url,
+        availability: availability_enum,
+        ..Default::default()
+    })?;
 
     println!("✓ Created event: {}", event.title);
     println!("  Start: {}", event.start_date.format("%Y-%m-%d %H:%M"));
@@ -881,7 +1285,7 @@ fn cmd_events_add(
     Ok(())
 }
 
-fn cmd_events_delete(id: &str, force: bool) -> Result<(), EventKitError> {
+fn cmd_events_delete(id: &str, force: bool, span: &str) -> Result<(), EventKitError> {
     let manager = EventsManager::new();
     let event = manager.get_event(id)?;
 
@@ -891,9 +1295,126 @@ fn cmd_events_delete(id: &str, force: bool) -> Result<(), EventKitError> {
         return Ok(());
     }
 
-    manager.delete_event(id, false)?;
-    println!("✓ Deleted: {}", event.title);
+    let affect_future = match span {
+        "this" => false,
+        "future" => true,
+        other => {
+            return Err(EventKitError::SaveFailed(format!(
+                "--span must be 'this' or 'future', got {other:?}"
+            )));
+        }
+    };
+    manager.delete_event(id, affect_future)?;
+    println!(
+        "✓ Deleted: {}{}",
+        event.title,
+        if affect_future {
+            " (and future occurrences)"
+        } else {
+            ""
+        }
+    );
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_events_update(
+    id: &str,
+    title: Option<&str>,
+    notes: Option<&str>,
+    location: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    all_day: Option<bool>,
+    calendar: Option<&str>,
+    url: Option<&str>,
+    availability: Option<&str>,
+    span: &str,
+) -> Result<(), EventKitError> {
+    if title.is_none()
+        && notes.is_none()
+        && location.is_none()
+        && start.is_none()
+        && end.is_none()
+        && all_day.is_none()
+        && calendar.is_none()
+        && url.is_none()
+        && availability.is_none()
+    {
+        eprintln!(
+            "No updates specified. Use one of --title/--notes/--location/--start/--end/--all-day/--calendar/--url/--availability."
+        );
+        return Ok(());
+    }
+
+    let parse_dt =
+        |label: &str, s: Option<&str>| -> Result<Option<DateTime<Local>>, EventKitError> {
+            match s {
+                None => Ok(None),
+                Some(raw) => parse_datetime(raw).map(Some).ok_or_else(|| {
+                    EventKitError::SaveFailed(format!(
+                        "Invalid {label}: '{raw}'. Use YYYY-MM-DD or YYYY-MM-DD HH:MM."
+                    ))
+                }),
+            }
+        };
+    let start_dt = parse_dt("--start", start)?;
+    let end_dt = parse_dt("--end", end)?;
+
+    let availability_enum = match availability {
+        None => None,
+        Some("busy") => Some(eventkit::EventAvailability::Busy),
+        Some("free") => Some(eventkit::EventAvailability::Free),
+        Some("tentative") => Some(eventkit::EventAvailability::Tentative),
+        Some("unavailable") => Some(eventkit::EventAvailability::Unavailable),
+        Some(other) => {
+            return Err(EventKitError::SaveFailed(format!(
+                "--availability must be busy|free|tentative|unavailable, got {other:?}"
+            )));
+        }
+    };
+
+    let span_enum = match span {
+        "this" => eventkit::EventSpan::This,
+        "future" => eventkit::EventSpan::Future,
+        other => {
+            return Err(EventKitError::SaveFailed(format!(
+                "--span must be 'this' or 'future', got {other:?}"
+            )));
+        }
+    };
+
+    fn opt_patch(s: Option<&str>) -> Option<Option<&str>> {
+        s.map(|v| if v.is_empty() { None } else { Some(v) })
+    }
+
+    let manager = EventsManager::new();
+    let updated = manager.update_event(
+        id,
+        &eventkit::EventPatch {
+            title,
+            notes: opt_patch(notes),
+            location: opt_patch(location),
+            start: start_dt,
+            end: end_dt,
+            all_day,
+            calendar_title: calendar,
+            URL: opt_patch(url),
+            availability: availability_enum,
+            structured_location: None,
+            span: span_enum,
+        },
+    )?;
+    println!(
+        "✓ Updated event: {}{}",
+        updated.title,
+        if matches!(span_enum, eventkit::EventSpan::Future) {
+            " (this and future occurrences)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
@@ -901,6 +1422,8 @@ fn cmd_events_delete(id: &str, force: bool) -> Result<(), EventKitError> {
 fn cmd_dump(cmd: DumpCommands) -> Result<(), EventKitError> {
     let json = match cmd {
         DumpCommands::Reminder { id } => eventkit::mcp::dump_reminder(&id)?,
+        DumpCommands::ReminderRaw { id, values } => eventkit::mcp::dump_reminder_raw(&id, values)?,
+        DumpCommands::ReminderPrivate { id } => eventkit::mcp::dump_reminder_private(&id)?,
         DumpCommands::Reminders { list } => eventkit::mcp::dump_reminders(list.as_deref())?,
         DumpCommands::Event { id } => eventkit::mcp::dump_event(&id)?,
         DumpCommands::Events { days } => eventkit::mcp::dump_events(days)?,

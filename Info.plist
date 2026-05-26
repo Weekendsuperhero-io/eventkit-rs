@@ -18,5 +18,7 @@
     <string>eventkit accesses your Calendar to list, create, update, and delete events on your behalf.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
     <string>eventkit uses your location when creating location-based reminders.</string>
+    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>eventkit needs background location access so location-based reminders can trigger when you arrive at or leave a place.</string>
 </dict>
 </plist>

@@ -4,8 +4,9 @@ use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
 use objc2_event_kit::{
-    EKAlarm, EKAlarmProximity, EKAuthorizationStatus, EKCalendar, EKCalendarItem, EKEntityType,
-    EKEvent, EKEventStore, EKRecurrenceDayOfWeek, EKRecurrenceEnd, EKRecurrenceFrequency,
+    EKAlarm, EKAlarmProximity, EKAlarmType, EKAuthorizationStatus, EKCalendar,
+    EKCalendarEventAvailabilityMask, EKCalendarItem, EKEntityType, EKEvent, EKEventAvailability,
+    EKEventStatus, EKEventStore, EKRecurrenceDayOfWeek, EKRecurrenceEnd, EKRecurrenceFrequency,
     EKRecurrenceRule, EKReminder, EKSource, EKSpan, EKStructuredLocation, EKWeekday,
 };
 use objc2_foundation::{
@@ -60,6 +61,12 @@ pub enum EventKitError {
 
     #[error("Invalid date range")]
     InvalidDateRange,
+
+    /// Returned when a string passed as a URL fails strict RFC 3986
+    /// validation (`+[NSURL URLWithString:encodingInvalidCharacters:NO]`
+    /// returned nil — invalid scheme, illegal characters, etc.).
+    #[error("Invalid URL: {0}")]
+    InvalidURL(String),
 }
 
 /// Backward compatibility alias
@@ -70,6 +77,7 @@ pub type Result<T> = std::result::Result<T, EventKitError>;
 
 /// Represents a reminder item with its properties
 #[derive(Debug, Clone)]
+#[allow(non_snake_case)]
 pub struct ReminderItem {
     /// Unique identifier for the reminder
     pub identifier: String,
@@ -96,13 +104,29 @@ pub struct ReminderItem {
     /// Location associated with the reminder
     pub location: Option<String>,
     /// URL associated with the reminder
-    pub url: Option<String>,
+    #[allow(non_snake_case)]
+    pub URL: Option<String>,
     /// Creation date of the reminder
     pub creation_date: Option<DateTime<Local>>,
     /// Last modified date of the reminder
     pub last_modified_date: Option<DateTime<Local>>,
     /// Timezone of the reminder
     pub timezone: Option<String>,
+    /// Timezone applied specifically to the due date — distinct from
+    /// `timezone`, which is the item-level zone. EventKit lets these differ
+    /// so a reminder can be "due at 9am New York time" regardless of the
+    /// item's own zone or the device zone.
+    pub due_date_timezone: Option<String>,
+    /// Geofence attached to the reminder via a location-based alarm.
+    /// `Some` when at least one alarm has a `structuredLocation` and
+    /// non-`None` proximity. EventKit has no `structuredLocation` property
+    /// directly on `EKReminder` / `EKCalendarItem` — it lives on the alarm.
+    pub structured_location: Option<StructuredLocation>,
+    /// Identifier of the parent reminder (when this reminder is a subtask).
+    /// Read via KVC because the underlying type is the private `EKObjectID`.
+    pub parent_id: Option<String>,
+    /// Number of file attachments. Full metadata is not yet surfaced.
+    pub attachments_count: usize,
     /// Whether the reminder has alarms
     pub has_alarms: bool,
     /// Whether the reminder has recurrence rules
@@ -113,6 +137,59 @@ pub struct ReminderItem {
     pub has_notes: bool,
     /// Attendees on this reminder (usually empty, possible on shared lists)
     pub attendees: Vec<ParticipantInfo>,
+}
+
+/// Input for `RemindersManager::create_reminder`. All fields except `title`
+/// are optional. Use `..Default::default()` for the unset ones.
+#[derive(Debug, Clone, Default)]
+#[allow(non_snake_case)]
+pub struct ReminderDraft<'a> {
+    pub title: &'a str,
+    pub notes: Option<&'a str>,
+    pub calendar_title: Option<&'a str>,
+    pub priority: Option<usize>,
+    pub due_date: Option<DateTime<Local>>,
+    pub start_date: Option<DateTime<Local>>,
+    #[allow(non_snake_case)]
+    pub URL: Option<&'a str>,
+    pub location: Option<&'a str>,
+    /// Rich location for Reminders.app's location chip — writes
+    /// `EKReminder.structuredLocation`. This is the field iCloud Reminders
+    /// actually persists; the plain-string `location` above is a legacy
+    /// CalDAV field that iCloud silently drops.
+    pub structured_location: Option<&'a StructuredLocation>,
+    /// IANA zone identifier for the due date, e.g. `"America/Los_Angeles"`.
+    pub due_date_timezone: Option<&'a str>,
+}
+
+/// Input for `RemindersManager::update_reminder`. Each field uses one of:
+/// `None` (don't touch), `Some(value)` (set), and for `Option<Option<T>>`
+/// fields, `Some(None)` (clear). Build with `..Default::default()`.
+#[derive(Debug, Clone, Default)]
+#[allow(non_snake_case)]
+pub struct ReminderPatch<'a> {
+    pub title: Option<&'a str>,
+    pub notes: Option<&'a str>,
+    pub completed: Option<bool>,
+    pub priority: Option<usize>,
+    pub due_date: Option<Option<DateTime<Local>>>,
+    pub start_date: Option<Option<DateTime<Local>>>,
+    pub calendar_title: Option<&'a str>,
+    #[allow(non_snake_case)]
+    pub URL: Option<Option<&'a str>>,
+    pub location: Option<Option<&'a str>>,
+    /// Rich location (the iCloud-persisted chip). `Some(Some(loc))` sets,
+    /// `Some(None)` clears, `None` leaves untouched.
+    pub structured_location: Option<Option<&'a StructuredLocation>>,
+    /// Same `Option<Option<...>>` semantics: `Some(Some("America/LA"))` sets,
+    /// `Some(None)` clears, `None` leaves untouched.
+    pub due_date_timezone: Option<Option<&'a str>>,
+    /// Explicit completion date. Apple's `setCompletionDate:` is the
+    /// authoritative completion toggle — a non-nil value implies
+    /// `isCompleted = YES` and a nil value implies `NO`. We apply this
+    /// **after** `completed` in `update_reminder`, so when both are
+    /// provided the date wins.
+    pub completion_date: Option<Option<DateTime<Local>>>,
 }
 
 /// Type of calendar/source.
@@ -157,12 +234,19 @@ pub struct CalendarInfo {
     pub color: Option<(f64, f64, f64, f64)>,
     /// Entity types this calendar supports ("event", "reminder")
     pub allowed_entity_types: Vec<String>,
+    /// Which `EventAvailability` values this calendar accepts on its events
+    /// — string forms of `EKCalendarEventAvailabilityMask`: e.g.
+    /// `["busy", "free", "tentative"]`. Empty when none are supported
+    /// (`EKCalendarEventAvailabilityNone`, common on reminder-only calendars).
+    /// Useful pre-flight check before `EventsManager::set_event_availability`.
+    pub supported_event_availabilities: Vec<String>,
 }
 
 /// Proximity trigger for a location-based alarm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AlarmProximity {
     /// No proximity trigger.
+    #[default]
     None,
     /// Trigger when entering the location.
     Enter,
@@ -184,7 +268,7 @@ pub struct StructuredLocation {
 }
 
 /// An alarm attached to a reminder or event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AlarmInfo {
     /// Offset in seconds before the due date (negative = before).
     pub relative_offset: Option<f64>,
@@ -194,11 +278,37 @@ pub struct AlarmInfo {
     pub proximity: AlarmProximity,
     /// Location for geofenced alarms.
     pub location: Option<StructuredLocation>,
+    /// Email address for email-type alarms (CalDAV server-side notification).
+    pub email_address: Option<String>,
+    /// Custom alarm sound name (audio-type alarms).
+    pub sound_name: Option<String>,
+    /// URL opened when the alarm fires (procedure-type alarm). Distinct
+    /// from `EKCalendarItem.URL` — that's lowercase `url` on `EKAlarm`.
+    /// Apple deprecated this property in macOS 10.9 but the API still
+    /// functions; we surface it for parity with the framework.
+    pub url: Option<String>,
+    /// Derived alarm type — Display/Audio/Procedure/Email. Apple infers
+    /// this from which of the optional fields above are set. Read-only on
+    /// output; ignored on input.
+    pub alarm_type: AlarmType,
+}
+
+/// EKAlarm.type — derived by Apple from which optional fields are set:
+/// `soundName` → Audio, `url` → Procedure, `emailAddress` → Email, else Display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlarmType {
+    #[default]
+    Display,
+    Audio,
+    Procedure,
+    Email,
+    Unknown,
 }
 
 /// How often a recurrence repeats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecurrenceFrequency {
+    #[default]
     Daily,
     Weekly,
     Monthly,
@@ -206,9 +316,10 @@ pub enum RecurrenceFrequency {
 }
 
 /// When a recurrence ends.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum RecurrenceEndCondition {
     /// Repeats forever.
+    #[default]
     Never,
     /// Ends after a number of occurrences.
     AfterCount(usize),
@@ -217,7 +328,7 @@ pub enum RecurrenceEndCondition {
 }
 
 /// A recurrence rule describing how a reminder or event repeats.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RecurrenceRule {
     /// How often it repeats (daily, weekly, monthly, yearly).
     pub frequency: RecurrenceFrequency,
@@ -229,6 +340,17 @@ pub struct RecurrenceRule {
     pub days_of_week: Option<Vec<u8>>,
     /// Days of the month (1-31, negatives count from end) for monthly rules.
     pub days_of_month: Option<Vec<i32>>,
+    /// Months of the year (1=Jan..12=Dec) for yearly rules.
+    pub months_of_year: Option<Vec<i32>>,
+    /// Weeks of the year (1..=53, negatives count from end). Yearly rules only.
+    pub weeks_of_year: Option<Vec<i32>>,
+    /// Days of the year (1..=366, negatives count from end). Yearly rules only.
+    pub days_of_year: Option<Vec<i32>>,
+    /// Set positions — filter applied after the other fields. E.g. with
+    /// `frequency = Monthly`, `days_of_week = [2]` (Monday), and
+    /// `set_positions = [1]` you get "the first Monday of every month".
+    /// Negative values count from the end.
+    pub set_positions: Option<Vec<i32>>,
 }
 
 /// The main reminders manager providing access to EventKit functionality
@@ -416,17 +538,91 @@ impl RemindersManager {
             .ok_or_else(|| RemindersError::FetchFailed("Unknown error".to_string()))
     }
 
-    /// Fetches incomplete reminders
+    /// Fetches incomplete reminders (no due-date filter, all calendars).
     pub fn fetch_incomplete_reminders(&self) -> Result<Vec<ReminderItem>> {
-        self.ensure_authorized()?;
+        self.fetch_incomplete_reminders_in_due_range(None, None, None)
+    }
 
+    /// Fetches incomplete reminders whose due date falls within the optional
+    /// `starting`..`ending` window. Either bound may be `None` to leave it
+    /// open-ended. `calendar_titles` filters to specific lists (passing
+    /// `None` searches all reminder calendars).
+    pub fn fetch_incomplete_reminders_in_due_range(
+        &self,
+        starting: Option<DateTime<Local>>,
+        ending: Option<DateTime<Local>>,
+        calendar_titles: Option<&[&str]>,
+    ) -> Result<Vec<ReminderItem>> {
+        self.ensure_authorized()?;
+        let calendars = self.resolve_reminder_calendars(calendar_titles)?;
+        let start_ns = starting.map(datetime_to_nsdate);
+        let end_ns = ending.map(datetime_to_nsdate);
         let predicate = unsafe {
             self.store
                 .predicateForIncompleteRemindersWithDueDateStarting_ending_calendars(
-                    None, None, None,
+                    start_ns.as_deref(),
+                    end_ns.as_deref(),
+                    calendars.as_deref(),
                 )
         };
+        self.fetch_by_predicate(&predicate)
+    }
 
+    /// Fetches completed reminders whose completion date falls within the
+    /// optional `starting`..`ending` window. Either bound may be `None`.
+    /// `calendar_titles` filters to specific lists.
+    pub fn fetch_completed_reminders_in_range(
+        &self,
+        starting: Option<DateTime<Local>>,
+        ending: Option<DateTime<Local>>,
+        calendar_titles: Option<&[&str]>,
+    ) -> Result<Vec<ReminderItem>> {
+        self.ensure_authorized()?;
+        let calendars = self.resolve_reminder_calendars(calendar_titles)?;
+        let start_ns = starting.map(datetime_to_nsdate);
+        let end_ns = ending.map(datetime_to_nsdate);
+        let predicate = unsafe {
+            self.store
+                .predicateForCompletedRemindersWithCompletionDateStarting_ending_calendars(
+                    start_ns.as_deref(),
+                    end_ns.as_deref(),
+                    calendars.as_deref(),
+                )
+        };
+        self.fetch_by_predicate(&predicate)
+    }
+
+    /// Resolves `calendar_titles` (`Some(&["A", "B"])` etc.) to an NSArray
+    /// of `EKCalendar` references restricted to reminder calendars. `None`
+    /// → `Ok(None)` meaning "all calendars". Unknown title → error.
+    fn resolve_reminder_calendars(
+        &self,
+        calendar_titles: Option<&[&str]>,
+    ) -> Result<Option<Retained<NSArray<EKCalendar>>>> {
+        let Some(titles) = calendar_titles else {
+            return Ok(None);
+        };
+        let all_calendars = unsafe { self.store.calendarsForEntityType(EKEntityType::Reminder) };
+        let mut matching: Vec<Retained<EKCalendar>> = Vec::new();
+        for cal in all_calendars.iter() {
+            let title_str = unsafe { cal.title() }.to_string();
+            if titles.iter().any(|t| *t == title_str) {
+                matching.push(cal.retain());
+            }
+        }
+        if matching.is_empty() {
+            return Err(RemindersError::CalendarNotFound(titles.join(", ")));
+        }
+        Ok(Some(NSArray::from_retained_slice(&matching)))
+    }
+
+    /// Runs the standard block-completion fetch dance against any predicate
+    /// and converts the returned EKReminders to ReminderItems. Used by all
+    /// `fetch_*` methods.
+    fn fetch_by_predicate(
+        &self,
+        predicate: &objc2_foundation::NSPredicate,
+    ) -> Result<Vec<ReminderItem>> {
         let result = Arc::new((Mutex::new(None::<Vec<ReminderItem>>), Condvar::new()));
         let result_clone = Arc::clone(&result);
 
@@ -445,7 +641,7 @@ impl RemindersManager {
 
         unsafe {
             self.store
-                .fetchRemindersMatchingPredicate_completion(&predicate, &completion);
+                .fetchRemindersMatchingPredicate_completion(predicate, &completion);
         }
 
         let (lock, cvar) = &*result;
@@ -453,64 +649,54 @@ impl RemindersManager {
         while guard.is_none() {
             guard = cvar.wait(guard).unwrap();
         }
-
         guard
             .take()
             .ok_or_else(|| RemindersError::FetchFailed("Unknown error".to_string()))
     }
 
-    /// Creates a new reminder
-    ///
-    /// # Arguments
-    /// * `title` - The reminder title
-    /// * `notes` - Optional notes/description
-    /// * `calendar_title` - Optional calendar/list name (uses default if None)
-    /// * `priority` - Optional priority (0 = none, 1-4 = high, 5 = medium, 6-9 = low)
-    /// * `due_date` - Optional due date for the reminder
-    /// * `start_date` - Optional start date (when to start working on it)
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_reminder(
-        &self,
-        title: &str,
-        notes: Option<&str>,
-        calendar_title: Option<&str>,
-        priority: Option<usize>,
-        due_date: Option<DateTime<Local>>,
-        start_date: Option<DateTime<Local>>,
-    ) -> Result<ReminderItem> {
+    /// Creates a new reminder. Build the input with `ReminderDraft` —
+    /// only `title` is required; spread `..Default::default()` for the rest.
+    pub fn create_reminder(&self, draft: &ReminderDraft<'_>) -> Result<ReminderItem> {
         self.ensure_authorized()?;
 
         let reminder = unsafe { EKReminder::reminderWithEventStore(&self.store) };
 
-        // Set title
-        let ns_title = NSString::from_str(title);
+        let ns_title = NSString::from_str(draft.title);
         unsafe { reminder.setTitle(Some(&ns_title)) };
 
-        // Set notes if provided
-        if let Some(notes_text) = notes {
+        if let Some(notes_text) = draft.notes {
             let ns_notes = NSString::from_str(notes_text);
             unsafe { reminder.setNotes(Some(&ns_notes)) };
         }
 
-        // Set priority if provided
-        if let Some(p) = priority {
+        if let Some(p) = draft.priority {
             unsafe { reminder.setPriority(p) };
         }
 
-        // Set due date if provided
-        if let Some(due) = due_date {
+        if let Some(due) = draft.due_date {
             let components = datetime_to_date_components(due);
             unsafe { reminder.setDueDateComponents(Some(&components)) };
         }
 
-        // Set start date if provided
-        if let Some(start) = start_date {
+        if let Some(start) = draft.start_date {
             let components = datetime_to_date_components(start);
             unsafe { reminder.setStartDateComponents(Some(&components)) };
         }
 
-        // Set calendar
-        let calendar = if let Some(cal_title) = calendar_title {
+        if draft.URL.is_some() {
+            set_item_URL(&reminder, draft.URL)?;
+        }
+        if draft.location.is_some() {
+            set_item_location(&reminder, draft.location);
+        }
+        if let Some(sl) = draft.structured_location {
+            set_reminder_structured_location(&reminder, Some(sl));
+        }
+        if draft.due_date_timezone.is_some() {
+            set_reminder_due_date_timezone(&reminder, draft.due_date_timezone);
+        }
+
+        let calendar = if let Some(cal_title) = draft.calendar_title {
             self.find_calendar_by_title(cal_title)?
         } else {
             unsafe { self.store.defaultCalendarForNewReminders() }
@@ -518,104 +704,116 @@ impl RemindersManager {
         };
         unsafe { reminder.setCalendar(Some(&calendar)) };
 
-        // Save
-        unsafe {
-            self.store
-                .saveReminder_commit_error(&reminder, true)
-                .map_err(|e| RemindersError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_reminder_and_refresh(&reminder)?;
 
         Ok(reminder_to_item(&reminder))
     }
 
-    /// Updates an existing reminder
-    ///
-    /// All fields are optional - only provided fields will be updated.
-    /// Pass `Some(None)` for due_date/start_date to clear them.
-    /// Use `calendar_title` to move the reminder to a different list.
-    #[allow(clippy::too_many_arguments)]
+    /// Updates an existing reminder. Build the changeset with `ReminderPatch`
+    /// — only set the fields you want to touch. For nullable string/timezone
+    /// fields, `Some(Some(v))` writes `v` and `Some(None)` clears.
     pub fn update_reminder(
         &self,
         identifier: &str,
-        title: Option<&str>,
-        notes: Option<&str>,
-        completed: Option<bool>,
-        priority: Option<usize>,
-        due_date: Option<Option<DateTime<Local>>>,
-        start_date: Option<Option<DateTime<Local>>>,
-        calendar_title: Option<&str>,
+        patch: &ReminderPatch<'_>,
     ) -> Result<ReminderItem> {
         self.ensure_authorized()?;
 
         let reminder = self.find_reminder_by_id(identifier)?;
 
-        if let Some(t) = title {
+        if let Some(t) = patch.title {
             let ns_title = NSString::from_str(t);
             unsafe { reminder.setTitle(Some(&ns_title)) };
         }
 
-        if let Some(n) = notes {
+        if let Some(n) = patch.notes {
             let ns_notes = NSString::from_str(n);
             unsafe { reminder.setNotes(Some(&ns_notes)) };
         }
 
-        if let Some(c) = completed {
+        if let Some(c) = patch.completed {
             unsafe { reminder.setCompleted(c) };
         }
 
-        if let Some(p) = priority {
+        if let Some(p) = patch.priority {
             unsafe { reminder.setPriority(p) };
         }
 
-        // Handle due date: Some(Some(date)) = set, Some(None) = clear, None = no change
-        if let Some(due_opt) = due_date {
+        if let Some(due_opt) = patch.due_date {
             match due_opt {
                 Some(due) => {
                     let components = datetime_to_date_components(due);
                     unsafe { reminder.setDueDateComponents(Some(&components)) };
                 }
-                None => {
-                    unsafe { reminder.setDueDateComponents(None) };
-                }
+                None => unsafe { reminder.setDueDateComponents(None) },
             }
         }
 
-        // Handle start date: Some(Some(date)) = set, Some(None) = clear, None = no change
-        if let Some(start_opt) = start_date {
+        if let Some(start_opt) = patch.start_date {
             match start_opt {
                 Some(start) => {
                     let components = datetime_to_date_components(start);
                     unsafe { reminder.setStartDateComponents(Some(&components)) };
                 }
-                None => {
-                    unsafe { reminder.setStartDateComponents(None) };
-                }
+                None => unsafe { reminder.setStartDateComponents(None) },
             }
         }
 
-        // Move to a different calendar/list if specified
-        if let Some(cal_title) = calendar_title {
+        if let Some(url_opt) = patch.URL {
+            set_item_URL(&reminder, url_opt)?;
+        }
+        if let Some(loc_opt) = patch.location {
+            set_item_location(&reminder, loc_opt);
+        }
+        if let Some(sl_opt) = patch.structured_location {
+            set_reminder_structured_location(&reminder, sl_opt);
+        }
+        if let Some(tz_opt) = patch.due_date_timezone {
+            set_reminder_due_date_timezone(&reminder, tz_opt);
+        }
+
+        // Apply completion_date AFTER `completed` so Apple's "completionDate
+        // is authoritative" semantics win when both are provided.
+        if let Some(cd_opt) = patch.completion_date {
+            match cd_opt {
+                Some(d) => {
+                    let nsdate = datetime_to_nsdate(d);
+                    unsafe { reminder.setCompletionDate(Some(&nsdate)) };
+                }
+                None => unsafe { reminder.setCompletionDate(None) },
+            }
+        }
+
+        if let Some(cal_title) = patch.calendar_title {
             let calendar = self.find_calendar_by_title(cal_title)?;
             unsafe { reminder.setCalendar(Some(&calendar)) };
         }
 
-        unsafe {
-            self.store
-                .saveReminder_commit_error(&reminder, true)
-                .map_err(|e| RemindersError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_reminder_and_refresh(&reminder)?;
 
         Ok(reminder_to_item(&reminder))
     }
 
     /// Marks a reminder as complete
     pub fn complete_reminder(&self, identifier: &str) -> Result<ReminderItem> {
-        self.update_reminder(identifier, None, None, Some(true), None, None, None, None)
+        self.update_reminder(
+            identifier,
+            &ReminderPatch {
+                completed: Some(true),
+                ..Default::default()
+            },
+        )
     }
 
     /// Marks a reminder as incomplete
     pub fn uncomplete_reminder(&self, identifier: &str) -> Result<ReminderItem> {
-        self.update_reminder(identifier, None, None, Some(false), None, None, None, None)
+        self.update_reminder(
+            identifier,
+            &ReminderPatch {
+                completed: Some(false),
+                ..Default::default()
+            },
+        )
     }
 
     /// Deletes a reminder
@@ -640,6 +838,59 @@ impl RemindersManager {
         Ok(reminder_to_item(&reminder))
     }
 
+    /// Dumps every Objective-C `@property` declared on the reminder, its
+    /// EKCalendar, and that calendar's EKSource — using runtime reflection
+    /// (`class_copyPropertyList`). Intended for figuring out which native
+    /// fields are not yet surfaced by [`ReminderItem`].
+    ///
+    /// If `read_values` is true, also reads each property via KVC
+    /// (`valueForKey:`). Some properties in EventKit are backed by Core Data
+    /// internals and hit C-level assertions when read this way — see the
+    /// hardcoded denylist in `reflect_object_full`. Use `false` for a fully
+    /// safe schema-only listing.
+    pub fn dump_reminder_raw(&self, identifier: &str, read_values: bool) -> Result<String> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+
+        let mut out = String::new();
+        out.push_str(&reflect_object_full(
+            "EKReminder (instance)",
+            &*reminder,
+            read_values,
+        ));
+
+        if let Some(calendar) = unsafe { reminder.calendar() } {
+            out.push('\n');
+            out.push_str(&reflect_object_full(
+                "EKCalendar (reminder.calendar)",
+                &*calendar,
+                read_values,
+            ));
+
+            if let Some(source) = unsafe { calendar.source() } {
+                out.push('\n');
+                out.push_str(&reflect_object_full(
+                    "EKSource (calendar.source)",
+                    &*source,
+                    read_values,
+                ));
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Probes a hardcoded list of suspected-private selectors on the reminder
+    /// — the kind of accessors that aren't generated by `objc2-event-kit`
+    /// and reject KVC `valueForKey:` (e.g. `structuredData`, `tags`,
+    /// `richLink`). Each call is wrapped in an Objective-C exception catch.
+    /// Read-only — never invokes any setter.
+    pub fn dump_reminder_private(&self, identifier: &str) -> Result<String> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        Ok(probe_private_selectors(&reminder))
+    }
+
     // ========================================================================
     // Alarm Management
     // ========================================================================
@@ -655,12 +906,8 @@ impl RemindersManager {
     pub fn add_alarm(&self, identifier: &str, alarm: &AlarmInfo) -> Result<()> {
         self.ensure_authorized()?;
         let reminder = self.find_reminder_by_id(identifier)?;
-        add_item_alarm(&reminder, alarm);
-        unsafe {
-            self.store
-                .saveReminder_commit_error(&reminder, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        add_item_alarm(&reminder, alarm)?;
+        self.save_reminder_and_refresh(&reminder)?;
         Ok(())
     }
 
@@ -669,11 +916,7 @@ impl RemindersManager {
         self.ensure_authorized()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         clear_item_alarms(&reminder);
-        unsafe {
-            self.store
-                .saveReminder_commit_error(&reminder, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_reminder_and_refresh(&reminder)?;
         Ok(())
     }
 
@@ -682,11 +925,7 @@ impl RemindersManager {
         self.ensure_authorized()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         remove_item_alarm(&reminder, index)?;
-        unsafe {
-            self.store
-                .saveReminder_commit_error(&reminder, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_reminder_and_refresh(&reminder)?;
         Ok(())
     }
 
@@ -695,15 +934,92 @@ impl RemindersManager {
     // ========================================================================
 
     /// Set or clear the URL on a reminder.
-    pub fn set_url(&self, identifier: &str, url: Option<&str>) -> Result<()> {
+    #[allow(non_snake_case)]
+    pub fn set_URL(&self, identifier: &str, url: Option<&str>) -> Result<()> {
         self.ensure_authorized()?;
         let reminder = self.find_reminder_by_id(identifier)?;
-        set_item_url(&reminder, url);
-        unsafe {
-            self.store
-                .saveReminder_commit_error(&reminder, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        set_item_URL(&reminder, url)?;
+        self.save_reminder_and_refresh(&reminder)?;
+        Ok(())
+    }
+
+    /// Set or clear the free-text `location` on a reminder.
+    pub fn set_location(&self, identifier: &str, location: Option<&str>) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        set_item_location(&reminder, location);
+        self.save_reminder_and_refresh(&reminder)?;
+        Ok(())
+    }
+
+    /// Set or clear `EKReminder.dueDateTimeZone`. `tz_name` must be an
+    /// IANA zone identifier (e.g. `"America/Los_Angeles"`).
+    pub fn set_due_date_timezone(&self, identifier: &str, tz_name: Option<&str>) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        set_reminder_due_date_timezone(&reminder, tz_name);
+        self.save_reminder_and_refresh(&reminder)?;
+        Ok(())
+    }
+
+    /// Set (or clear) the reminder's rich location — `EKReminder.structuredLocation`
+    /// (not in `objc2-event-kit` 0.3 generated bindings — accessed via
+    /// `msg_send!`).
+    ///
+    /// **iCloud caveat:** verified empirically — iCloud silently drops this
+    /// mutation on reminder objects even though the save returns success.
+    /// Use [`set_geofence`](Self::set_geofence) instead for iCloud-synced
+    /// reminders; it writes the structured location on a proximity alarm,
+    /// which iCloud does persist. This method remains correct for local /
+    /// non-iCloud reminder sources.
+    pub fn set_structured_location(
+        &self,
+        identifier: &str,
+        loc: Option<&StructuredLocation>,
+    ) -> Result<()> {
+        self.ensure_authorized()?;
+        let reminder = self.find_reminder_by_id(identifier)?;
+        set_reminder_structured_location(&reminder, loc);
+        self.save_reminder_and_refresh(&reminder)?;
+        Ok(())
+    }
+
+    /// Attach (or clear) a geofence on the reminder. Implemented as a
+    /// location-based `EKAlarm` since EventKit has no `structuredLocation`
+    /// directly on `EKReminder` / `EKCalendarItem`. When `geofence` is
+    /// `Some`, also requests WhenInUse location authorization so the alarm
+    /// actually has permission to fire — if the user denies, the save is
+    /// aborted with an authorization error.
+    pub fn set_geofence(
+        &self,
+        identifier: &str,
+        geofence: Option<(&StructuredLocation, AlarmProximity)>,
+    ) -> Result<()> {
+        self.ensure_authorized()?;
+
+        // Prompt for location auth before saving a geofence. Without this we
+        // would silently create a reminder whose proximity trigger can't fire.
+        #[cfg(feature = "location")]
+        if geofence.is_some() {
+            use crate::location::{LocationAuthorizationStatus as L, LocationManager};
+            let loc_mgr = LocationManager::new();
+            if loc_mgr.authorization_status() == L::NotDetermined {
+                loc_mgr.request_when_in_use_authorization();
+                // CLLocationManager delivers the result asynchronously on the
+                // run loop. Match the polling pattern get_current_location uses.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            match loc_mgr.authorization_status() {
+                L::Authorized => {}
+                L::Denied => return Err(EventKitError::AuthorizationDenied),
+                L::Restricted => return Err(EventKitError::AuthorizationRestricted),
+                L::NotDetermined => return Err(EventKitError::AuthorizationNotDetermined),
+            }
         }
+
+        let reminder = self.find_reminder_by_id(identifier)?;
+        set_reminder_geofence(&reminder, geofence);
+        self.save_reminder_and_refresh(&reminder)?;
         Ok(())
     }
 
@@ -723,11 +1039,7 @@ impl RemindersManager {
         self.ensure_authorized()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         set_item_recurrence_rule(&reminder, rule);
-        unsafe {
-            self.store
-                .saveReminder_commit_error(&reminder, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_reminder_and_refresh(&reminder)?;
         Ok(())
     }
 
@@ -736,11 +1048,7 @@ impl RemindersManager {
         self.ensure_authorized()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         clear_item_recurrence_rules(&reminder);
-        unsafe {
-            self.store
-                .saveReminder_commit_error(&reminder, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_reminder_and_refresh(&reminder)?;
         Ok(())
     }
 
@@ -899,7 +1207,26 @@ impl RemindersManager {
     }
 
     // Helper to find a reminder by identifier
+    /// Commit a reminder to the store and refresh sources, so a subsequent
+    /// `find_reminder_by_id` or fetch sees the just-saved state without
+    /// waiting for the daemon to notice. All `pub fn` save paths on
+    /// `RemindersManager` route through this helper.
+    fn save_reminder_and_refresh(&self, reminder: &EKReminder) -> Result<()> {
+        unsafe {
+            self.store
+                .saveReminder_commit_error(reminder, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+            self.store.refreshSourcesIfNecessary();
+        }
+        Ok(())
+    }
+
     fn find_reminder_by_id(&self, identifier: &str) -> Result<Retained<EKReminder>> {
+        // Pick up any changes the user made in Reminders.app since the
+        // store was created — without this, iCloud edits made on the same
+        // machine may not be visible until next process launch.
+        unsafe { self.store.refreshSourcesIfNecessary() };
+
         let ns_id = NSString::from_str(identifier);
         let item = unsafe { self.store.calendarItemWithIdentifier(&ns_id) };
 
@@ -969,6 +1296,400 @@ impl std::fmt::Display for AuthorizationStatus {
 }
 
 // Helper function to convert EKReminder to ReminderItem
+/// Walks the class chain of `obj` and lists every declared `@property`,
+/// reading each one via KVC (`-[NSObject valueForKey:]`). The returned string
+/// is multi-section human-readable text — one section per class in the chain.
+///
+/// Only intended for diagnostics: KVC dispatch is slower than direct method
+/// calls and may throw NSException for very unusual property declarations.
+// Properties whose KVC read path hits a C-level assertion (CADObjectID etc.)
+// and aborts the process. Skip these unconditionally when `read_values` is on.
+// Discovered empirically — add to this list when a new abort is found.
+const REFLECT_VALUE_DENYLIST: &[&str] =
+    &["objectID", "objectIDURIRepresentation", "URIRepresentation"];
+
+fn reflect_object_full<T: Message>(header: &str, obj: &T, read_values: bool) -> String {
+    use objc2::ffi::{class_copyPropertyList, free, property_getAttributes, property_getName};
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use std::ffi::CStr;
+
+    // Cast to AnyObject for runtime introspection. `T: Message` guarantees
+    // this is an Objective-C object with a valid isa pointer.
+    let obj: &AnyObject = unsafe { &*(obj as *const T as *const AnyObject) };
+
+    let mut out = String::new();
+    out.push_str(&format!("=== {header} ===\n"));
+
+    // Build the class chain (most-derived first).
+    let mut chain: Vec<&'static AnyClass> = Vec::new();
+    let mut current = Some(obj.class());
+    while let Some(cls) = current {
+        chain.push(cls);
+        current = cls.superclass();
+    }
+    out.push_str("Class chain: ");
+    out.push_str(
+        &chain
+            .iter()
+            .map(|c| c.name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" -> "),
+    );
+    out.push_str("\n\n");
+
+    for cls in &chain {
+        let cls_name = cls.name().to_string_lossy().into_owned();
+        // Stop at NSObject — its properties are noise (hash, description, ...).
+        if cls_name == "NSObject" {
+            continue;
+        }
+
+        let mut count: u32 = 0;
+        let props_ptr =
+            unsafe { class_copyPropertyList(*cls as *const AnyClass, &mut count as *mut u32) };
+        if props_ptr.is_null() || count == 0 {
+            if !props_ptr.is_null() {
+                unsafe { free(props_ptr as *mut _) };
+            }
+            continue;
+        }
+
+        let mut entries: Vec<(String, String, String)> = Vec::new();
+        for i in 0..count as isize {
+            let prop = unsafe { *props_ptr.offset(i) };
+            if prop.is_null() {
+                continue;
+            }
+            let name_ptr = unsafe { property_getName(prop) };
+            let attrs_ptr = unsafe { property_getAttributes(prop) };
+            let name = if name_ptr.is_null() {
+                String::from("<?>")
+            } else {
+                unsafe { CStr::from_ptr(name_ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let attrs = if attrs_ptr.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(attrs_ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            // Anything typed `EKObjectID` / `NSManagedObjectID` / `CADObjectID`
+            // hits a CoreData `__assert_rtn` on KVC read and will SIGABRT.
+            // Filter by type encoding rather than name — safer as new
+            // properties are added in future SDKs.
+            let type_is_objectid = attrs.contains("ObjectID");
+
+            let value_str = if !read_values {
+                String::from("<value read skipped (pass --values to attempt)>")
+            } else if REFLECT_VALUE_DENYLIST.contains(&name.as_str()) || type_is_objectid {
+                String::from("<skipped: type/name denylisted (would abort process)>")
+            } else {
+                // Read via KVC, catching any NSException. Note: this catches
+                // ObjC exceptions but NOT C-level assertions (`__assert_rtn`),
+                // which abort the process directly — hence the denylist above.
+                let name_for_closure = name.clone();
+                let obj_ptr = obj as *const AnyObject;
+                match objc2::exception::catch(std::panic::AssertUnwindSafe(move || {
+                    let key = NSString::from_str(&name_for_closure);
+                    let obj_ref: &AnyObject = unsafe { &*obj_ptr };
+                    let value_obj: Option<Retained<AnyObject>> =
+                        unsafe { msg_send![obj_ref, valueForKey: &*key] };
+                    match value_obj {
+                        None => String::from("(null)"),
+                        Some(v) => describe_object(&v),
+                    }
+                })) {
+                    Ok(s) => s,
+                    Err(Some(exc)) => {
+                        format!("<NSException: {}>", describe_object(&**exc as &AnyObject))
+                    }
+                    Err(None) => String::from("<unknown ObjC exception>"),
+                }
+            };
+
+            entries.push((name, attrs, value_str));
+        }
+        unsafe { free(props_ptr as *mut _) };
+
+        if entries.is_empty() {
+            continue;
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        out.push_str(&format!("[{cls_name}]\n"));
+        for (name, attrs, value) in entries {
+            out.push_str(&format!("  {name}\n"));
+            out.push_str(&format!("    attrs: {attrs}\n"));
+            // Indent multi-line values so they don't break the layout.
+            let indented = value.replace('\n', "\n      ");
+            out.push_str(&format!("    value: {indented}\n"));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Probes a curated list of selectors that are not generated by
+/// `objc2-event-kit` and that KVC rejects on `EKReminder`. Each call is
+/// wrapped in `objc2::exception::catch` so a missing selector ("unrecognized
+/// selector sent to instance") becomes a printable line instead of an abort.
+///
+/// This is a fishing expedition — the selector names are educated guesses
+/// based on Apple's public naming patterns and what Reminders.app surfaces.
+/// Add entries as new candidates come up; the cost of an extra probe is one
+/// caught NSException.
+fn probe_private_selectors(reminder: &EKReminder) -> String {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, Sel};
+    use std::ffi::CString;
+
+    const PROBES: &[&str] = &[
+        // Rich-link / preview URL candidates
+        "appLink",      // <- confirmed exists on EKCalendarItem (method dump)
+        "URLString",    // <- confirmed exists on EKCalendarItem
+        "externalData", // <- confirmed exists on EKCalendarItem
+        "externalModificationTag",
+        "richLink",
+        "richLinkData",
+        "URLWithPreview",
+        "urlPreview",
+        "linkPreview",
+        "siriSuggestedURL",
+        "displayURL",
+        "flaggedURL",
+        "_richLink",
+        "_url",
+        "primaryLink",
+        // Structured-location candidates on the reminder itself
+        "structuredLocation",
+        "geoLocation",
+        "place",
+        "placemark",
+        // Tag candidates
+        "tags",
+        "tagDictionaries",
+        "tagNames",
+        "userTags",
+        "_tags",
+        "_tagDictionaries",
+        "hashtags",
+        // Backing structured-data blobs (KVC-blocked, try typed accessor)
+        "structuredData",
+        "localStructuredData",
+        "_structuredData",
+        // "Melted" (mutable) vs frozen reminder layer
+        "meltedObject",
+        "unfrozen",
+        "unfrozenObject",
+        "writableInstance",
+        // Misc EventKit private surfaces
+        "flags",
+        "flags2",
+        "isFlagged",
+        "image",
+        "imageData",
+        "thumbnail",
+        "color",
+        "creatorBundleID",
+        // Subtask / parent
+        "parentReminder",
+        "subreminders",
+        "subtasks",
+        "childReminders",
+    ];
+
+    let obj: &AnyObject = unsafe { &*(reminder as *const EKReminder as *const AnyObject) };
+    let mut out = String::from("=== Private-selector probe on EKReminder ===\n");
+    out.push_str("(each call wrapped in @try/@catch — caught exceptions mean the selector doesn't exist on this class)\n\n");
+
+    for name in PROBES {
+        let c_name = CString::new(*name).expect("selector name has no NUL");
+        let sel = Sel::register(&c_name);
+        let name_owned = name.to_string();
+        let obj_ptr = obj as *const AnyObject;
+        let line = match objc2::exception::catch(std::panic::AssertUnwindSafe(move || {
+            // Confirm the object responds before we send, so we get a clean
+            // "doesn't respond" instead of an NSException for the common case.
+            let obj_ref: &AnyObject = unsafe { &*obj_ptr };
+            let responds: bool = unsafe { msg_send![obj_ref, respondsToSelector: sel] };
+            if !responds {
+                return format!("{name_owned}: <does not respond>");
+            }
+            let result: Option<Retained<AnyObject>> =
+                unsafe { msg_send![obj_ref, performSelector: sel] };
+            match result {
+                None => format!("{name_owned}: (null)"),
+                Some(v) => {
+                    let cls: &objc2::runtime::AnyClass = (*v).class();
+                    let cls_name = cls.name().to_string_lossy().into_owned();
+                    let desc = describe_object(&v);
+                    let one_line = desc.replace('\n', "\\n");
+                    format!("{name_owned}: [{cls_name}] {one_line}")
+                }
+            }
+        })) {
+            Ok(s) => s,
+            Err(Some(exc)) => format!(
+                "{name}: <NSException: {}>",
+                describe_object(&**exc as &AnyObject)
+            ),
+            Err(None) => format!("{name}: <unknown ObjC exception>"),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    // Drill into the underlying persistent object — `backingObject` is the
+    // EKPersistentObject the frozen wrapper proxies. If a method is
+    // KVC-blocked on the frozen wrapper it may work on the backing object.
+    let backing: Option<Retained<AnyObject>> = unsafe { msg_send![obj, backingObject] };
+    if let Some(backing) = backing {
+        let bcls = (*backing).class().name().to_string_lossy().into_owned();
+        out.push_str(&format!("\n--- backingObject ({bcls}) probe ---\n"));
+        for name in PROBES {
+            let c_name = std::ffi::CString::new(*name).expect("no NUL");
+            let sel = objc2::runtime::Sel::register(&c_name);
+            let name_owned = name.to_string();
+            let backing_ptr = &*backing as *const AnyObject;
+            let line = match objc2::exception::catch(std::panic::AssertUnwindSafe(move || {
+                let bref: &AnyObject = unsafe { &*backing_ptr };
+                let responds: bool = unsafe { msg_send![bref, respondsToSelector: sel] };
+                if !responds {
+                    return format!("{name_owned}: <does not respond>");
+                }
+                let result: Option<Retained<AnyObject>> =
+                    unsafe { msg_send![bref, performSelector: sel] };
+                match result {
+                    None => format!("{name_owned}: (null)"),
+                    Some(v) => {
+                        let cls = (*v).class().name().to_string_lossy().into_owned();
+                        format!(
+                            "{name_owned}: [{cls}] {}",
+                            describe_object(&v).replace('\n', "\\n")
+                        )
+                    }
+                }
+            })) {
+                Ok(s) => s,
+                Err(Some(exc)) => format!(
+                    "{name}: <NSException: {}>",
+                    describe_object(&**exc as &AnyObject)
+                ),
+                Err(None) => format!("{name}: <unknown ObjC exception>"),
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    // Bonus: enumerate every instance method via the runtime, filtered to
+    // names that look URL/tag/link/data-related. This catches selectors we
+    // didn't guess in PROBES.
+    out.push_str(
+        "\n--- All zero-arg instance methods on EKReminder containing url/tag/link/data ---\n",
+    );
+    out.push_str(&list_interesting_methods(obj.class()));
+    out
+}
+
+/// Lists every instance method on `cls` (walking up the class chain to EKObject)
+/// whose selector name contains `url`, `tag`, `link`, `data`, `flag`, `image`,
+/// `preview`, or `attachment`. Doesn't call them — just shows what exists.
+fn list_interesting_methods(start: &objc2::runtime::AnyClass) -> String {
+    use objc2::ffi::{class_copyMethodList, free, method_getName};
+    use objc2::runtime::AnyClass;
+    use std::ffi::CStr;
+
+    let needles = [
+        "url",
+        "tag",
+        "link",
+        "data",
+        "flag",
+        "image",
+        "preview",
+        "attachment",
+        "rich",
+        "location",
+        "structured",
+        "place",
+        "address",
+        "geo",
+    ];
+    let mut hits: Vec<(String, String)> = Vec::new();
+
+    let mut current: Option<&AnyClass> = Some(start);
+    while let Some(cls) = current {
+        let cls_name = cls.name().to_string_lossy().into_owned();
+        if cls_name == "NSObject" {
+            break;
+        }
+        let mut count: u32 = 0;
+        let ptr = unsafe { class_copyMethodList(cls as *const AnyClass, &mut count as *mut u32) };
+        if !ptr.is_null() {
+            for i in 0..count as isize {
+                let m = unsafe { *ptr.offset(i) };
+                if m.is_null() {
+                    continue;
+                }
+                let Some(sel) = (unsafe { method_getName(m) }) else {
+                    continue;
+                };
+                let name_cstr_ptr = unsafe { objc2::ffi::sel_getName(sel) };
+                if name_cstr_ptr.is_null() {
+                    continue;
+                }
+                let name = unsafe { CStr::from_ptr(name_cstr_ptr) }
+                    .to_string_lossy()
+                    .into_owned();
+                let lower = name.to_lowercase();
+                if needles.iter().any(|n| lower.contains(n)) {
+                    hits.push((cls_name.clone(), name));
+                }
+            }
+            unsafe { free(ptr as *mut _) };
+        }
+        current = cls.superclass();
+    }
+    hits.sort();
+    hits.dedup();
+    if hits.is_empty() {
+        return String::from("(none)\n");
+    }
+    let mut out = String::new();
+    for (cls, sel) in hits {
+        out.push_str(&format!("  [{cls}] {sel}\n"));
+    }
+    out
+}
+
+/// `-[NSObject description]` as a Rust string. Returns `<nil>` for null,
+/// `<no description>` if the object doesn't respond to description.
+fn describe_object(obj: &objc2::runtime::AnyObject) -> String {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+
+    let desc: Option<Retained<AnyObject>> = unsafe { msg_send![obj, description] };
+    match desc {
+        None => String::from("<no description>"),
+        Some(d) => {
+            // description always returns NSString — cast pointer-wise.
+            let any: &AnyObject = &d;
+            let ns: &NSString = unsafe { &*(any as *const AnyObject as *const NSString) };
+            ns.to_string()
+        }
+    }
+}
+
 fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
     let identifier = unsafe { reminder.calendarItemIdentifier() }.to_string();
     let title = unsafe { reminder.title() }.to_string();
@@ -997,7 +1718,8 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
     let external_identifier =
         unsafe { reminder.calendarItemExternalIdentifier() }.map(|id| id.to_string());
     let location = unsafe { reminder.location() }.map(|loc| loc.to_string());
-    let url = unsafe { reminder.URL() }
+    #[allow(non_snake_case)]
+    let URL = unsafe { reminder.URL() }
         .as_ref()
         .and_then(|url_ref| url_ref.absoluteString())
         .map(|abs_str| abs_str.to_string());
@@ -1005,6 +1727,10 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
     let last_modified_date =
         unsafe { reminder.lastModifiedDate() }.map(|date| nsdate_to_datetime(&date));
     let timezone = unsafe { reminder.timeZone() }.map(|tz| tz.name().to_string());
+    let due_date_timezone = get_reminder_due_date_timezone(reminder);
+    let structured_location = get_reminder_structured_location(reminder);
+    let parent_id = get_reminder_parent_id(reminder);
+    let attachments_count = get_item_attachments_count(reminder);
     let has_alarms = unsafe { reminder.hasAlarms() };
     let has_recurrence_rules = unsafe { reminder.hasRecurrenceRules() };
     let has_attendees = unsafe { reminder.hasAttendees() };
@@ -1023,16 +1749,127 @@ fn reminder_to_item(reminder: &EKReminder) -> ReminderItem {
         completion_date,
         external_identifier,
         location,
-        url,
+        URL,
         creation_date,
         last_modified_date,
         timezone,
+        due_date_timezone,
+        structured_location,
+        parent_id,
+        attachments_count,
         has_alarms,
         has_recurrence_rules,
         has_attendees,
         has_notes,
         attendees: get_item_attendees(reminder),
     }
+}
+
+/// Read `EKReminder.dueDateTimeZone` via msg_send — not exposed in
+/// `objc2-event-kit` 0.3 generated bindings.
+fn get_reminder_due_date_timezone(reminder: &EKReminder) -> Option<String> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    let tz: Option<Retained<objc2_foundation::NSTimeZone>> =
+        unsafe { msg_send![reminder, dueDateTimeZone] };
+    tz.map(|tz| tz.name().to_string())
+}
+
+/// Reads `EKReminder.structuredLocation` — the iCloud-native location chip
+/// that Reminders.app displays. Apple shipped this on `EKCalendarItem` but
+/// `objc2-event-kit` 0.3 doesn't generate bindings for it on reminders
+/// (only on `EKEvent`/`EKAlarm`), so we go through `msg_send!`.
+///
+/// Falls back to the alarm-based geofence path for older reminders whose
+/// location is only attached via a proximity alarm.
+fn get_reminder_structured_location(reminder: &EKReminder) -> Option<StructuredLocation> {
+    if let Some(sl) = direct_structured_location(reminder) {
+        return Some(sl);
+    }
+    // Legacy fallback: scan alarms for proximity-bearing structured location.
+    let alarms = unsafe { reminder.alarms() }?;
+    for i in 0..alarms.len() {
+        let alarm = alarms.objectAtIndex(i);
+        let prox = unsafe { alarm.proximity() };
+        if prox == EKAlarmProximity::None {
+            continue;
+        }
+        let Some(structured) = (unsafe { alarm.structuredLocation() }) else {
+            continue;
+        };
+        return Some(structured_to_plain(&structured));
+    }
+    None
+}
+
+fn direct_structured_location(reminder: &EKReminder) -> Option<StructuredLocation> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    let sl: Option<Retained<EKStructuredLocation>> =
+        unsafe { msg_send![reminder, structuredLocation] };
+    sl.map(|s| structured_to_plain(&s))
+}
+
+fn structured_to_plain(structured: &EKStructuredLocation) -> StructuredLocation {
+    let title = unsafe { structured.title() }
+        .map(|t| t.to_string())
+        .unwrap_or_default();
+    let radius = unsafe { structured.radius() };
+    let (latitude, longitude) = read_geo_location_coords(structured);
+    StructuredLocation {
+        title,
+        latitude,
+        longitude,
+        radius,
+    }
+}
+
+/// Pull lat/lng off an `EKStructuredLocation`'s `geoLocation` (CLLocation).
+/// Returns (0.0, 0.0) when the `location` feature is disabled — coordinates
+/// require CoreLocation bindings.
+#[cfg(feature = "location")]
+fn read_geo_location_coords(structured: &EKStructuredLocation) -> (f64, f64) {
+    let cl = unsafe { structured.geoLocation() };
+    let Some(cl) = cl else { return (0.0, 0.0) };
+    let coord = unsafe { cl.coordinate() };
+    (coord.latitude, coord.longitude)
+}
+
+#[cfg(not(feature = "location"))]
+fn read_geo_location_coords(_structured: &EKStructuredLocation) -> (f64, f64) {
+    (0.0, 0.0)
+}
+
+/// Read `EKReminder.parentID` via KVC. The underlying type is the private
+/// `EKObjectID`; we stringify via `-[description]`. Returns `None` if the
+/// reminder has no parent or if the KVC read throws.
+fn get_reminder_parent_id(reminder: &EKReminder) -> Option<String> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    let reminder_obj: &AnyObject = unsafe { &*(reminder as *const EKReminder as *const AnyObject) };
+    let reminder_ptr = reminder_obj as *const AnyObject;
+    let value = objc2::exception::catch(std::panic::AssertUnwindSafe(move || {
+        let key = NSString::from_str("parentID");
+        let obj_ref: &AnyObject = unsafe { &*reminder_ptr };
+        let v: Option<Retained<AnyObject>> = unsafe { msg_send![obj_ref, valueForKey: &*key] };
+        v
+    }))
+    .ok()
+    .flatten()?;
+    let desc: Retained<AnyObject> = unsafe { msg_send![&*value, description] };
+    let ns: &NSString = unsafe { &*(&*desc as *const AnyObject as *const NSString) };
+    Some(ns.to_string())
+}
+
+/// Number of file attachments on the item. EventKit doesn't expose the
+/// attachment objects via the public Rust bindings; we just count them.
+fn get_item_attachments_count(item: &EKCalendarItem) -> usize {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2_foundation::NSArray;
+    let attachments: Option<Retained<NSArray>> = unsafe { msg_send![item, attachments] };
+    attachments.map(|a| a.len()).unwrap_or(0)
 }
 
 // Helper function to convert EKCalendar to CalendarInfo
@@ -1108,6 +1945,24 @@ fn calendar_to_info(calendar: &EKCalendar) -> CalendarInfo {
         allowed_entity_types.push("reminder".to_string());
     }
 
+    // EKCalendarEventAvailabilityMask: bitfield of which availability values
+    // this calendar accepts on events. Bits: Busy=1, Free=2, Tentative=4,
+    // Unavailable=8. Empty Vec = `EKCalendarEventAvailabilityNone`.
+    let avail_mask = unsafe { calendar.supportedEventAvailabilities() };
+    let mut supported_event_availabilities = Vec::new();
+    if avail_mask.contains(EKCalendarEventAvailabilityMask::Busy) {
+        supported_event_availabilities.push("busy".to_string());
+    }
+    if avail_mask.contains(EKCalendarEventAvailabilityMask::Free) {
+        supported_event_availabilities.push("free".to_string());
+    }
+    if avail_mask.contains(EKCalendarEventAvailabilityMask::Tentative) {
+        supported_event_availabilities.push("tentative".to_string());
+    }
+    if avail_mask.contains(EKCalendarEventAvailabilityMask::Unavailable) {
+        supported_event_availabilities.push("unavailable".to_string());
+    }
+
     CalendarInfo {
         identifier,
         title,
@@ -1119,6 +1974,7 @@ fn calendar_to_info(calendar: &EKCalendar) -> CalendarInfo {
         is_subscribed,
         color,
         allowed_entity_types,
+        supported_event_availabilities,
     }
 }
 
@@ -1127,22 +1983,82 @@ fn calendar_to_info(calendar: &EKCalendar) -> CalendarInfo {
 // ============================================================================
 
 /// Event availability for scheduling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EventAvailability {
     NotSupported,
+    #[default]
     Busy,
     Free,
     Tentative,
     Unavailable,
 }
 
+impl EventAvailability {
+    /// Convert to the raw `EKEventAvailability` for writing.
+    pub fn to_ek(self) -> EKEventAvailability {
+        match self {
+            Self::NotSupported => EKEventAvailability::NotSupported,
+            Self::Busy => EKEventAvailability::Busy,
+            Self::Free => EKEventAvailability::Free,
+            Self::Tentative => EKEventAvailability::Tentative,
+            Self::Unavailable => EKEventAvailability::Unavailable,
+        }
+    }
+
+    /// Map an `EKEventAvailability` back to our enum. Unknown raw values
+    /// (future Apple additions) fall back to `NotSupported`.
+    pub fn from_ek(raw: EKEventAvailability) -> Self {
+        match raw {
+            EKEventAvailability::NotSupported => Self::NotSupported,
+            EKEventAvailability::Busy => Self::Busy,
+            EKEventAvailability::Free => Self::Free,
+            EKEventAvailability::Tentative => Self::Tentative,
+            EKEventAvailability::Unavailable => Self::Unavailable,
+            _ => Self::NotSupported,
+        }
+    }
+}
+
 /// Event status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EventStatus {
+    #[default]
     None,
     Confirmed,
     Tentative,
     Canceled,
+}
+
+impl EventStatus {
+    pub fn from_ek(raw: EKEventStatus) -> Self {
+        match raw {
+            EKEventStatus::None => Self::None,
+            EKEventStatus::Confirmed => Self::Confirmed,
+            EKEventStatus::Tentative => Self::Tentative,
+            EKEventStatus::Canceled => Self::Canceled,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Scope of a recurring-event edit or delete — mirrors Apple's `EKSpan`.
+///
+/// - `This`: only the specific occurrence you have a reference to.
+/// - `Future`: this occurrence and every later occurrence in the same series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventSpan {
+    #[default]
+    This,
+    Future,
+}
+
+impl EventSpan {
+    pub(crate) fn to_ek(self) -> EKSpan {
+        match self {
+            Self::This => EKSpan::ThisEvent,
+            Self::Future => EKSpan::FutureEvents,
+        }
+    }
 }
 
 /// Participant role in an event.
@@ -1170,9 +2086,10 @@ pub enum ParticipantStatus {
 
 /// A participant (attendee) on an event or reminder.
 #[derive(Debug, Clone)]
+#[allow(non_snake_case)]
 pub struct ParticipantInfo {
     pub name: Option<String>,
-    pub url: Option<String>,
+    pub URL: Option<String>,
     pub role: ParticipantRole,
     pub status: ParticipantStatus,
     pub is_current_user: bool,
@@ -1180,6 +2097,7 @@ pub struct ParticipantInfo {
 
 /// Represents a calendar event with its properties.
 #[derive(Debug, Clone)]
+#[allow(non_snake_case)]
 pub struct EventItem {
     /// Unique identifier for the event
     pub identifier: String,
@@ -1200,7 +2118,8 @@ pub struct EventItem {
     /// Calendar identifier
     pub calendar_id: Option<String>,
     /// URL associated with the event
-    pub url: Option<String>,
+    #[allow(non_snake_case)]
+    pub URL: Option<String>,
     /// Availability for scheduling
     pub availability: EventAvailability,
     /// Event status (read-only)
@@ -1211,10 +2130,62 @@ pub struct EventItem {
     pub occurrence_date: Option<DateTime<Local>>,
     /// Geo-coordinate location
     pub structured_location: Option<StructuredLocation>,
+    /// Date the event was first created (`EKCalendarItem.creationDate`).
+    pub creation_date: Option<DateTime<Local>>,
+    /// Date the event was last modified (`EKCalendarItem.lastModifiedDate`).
+    pub last_modified_date: Option<DateTime<Local>>,
+    /// Server-provided external identifier (`EKCalendarItem.calendarItemExternalIdentifier`).
+    pub external_identifier: Option<String>,
+    /// Item-level timezone (`EKCalendarItem.timeZone`). Distinct from the
+    /// start/end date timezones — this is the event's own zone hint.
+    pub timezone: Option<String>,
+    /// Number of file attachments on the event (bound-less today — just the count).
+    pub attachments_count: usize,
     /// Attendees
     pub attendees: Vec<ParticipantInfo>,
     /// Event organizer
     pub organizer: Option<ParticipantInfo>,
+}
+
+/// Input for `EventsManager::create_event`. Only `title`, `start`, and `end`
+/// are required; spread `..Default::default()` for the rest. Mirrors
+/// `ReminderDraft` for consistency.
+#[derive(Debug, Clone, Default)]
+#[allow(non_snake_case)]
+pub struct EventDraft<'a> {
+    pub title: &'a str,
+    pub start: Option<DateTime<Local>>,
+    pub end: Option<DateTime<Local>>,
+    pub notes: Option<&'a str>,
+    pub location: Option<&'a str>,
+    pub calendar_title: Option<&'a str>,
+    pub all_day: bool,
+    pub URL: Option<&'a str>,
+    pub availability: Option<EventAvailability>,
+    pub structured_location: Option<&'a StructuredLocation>,
+}
+
+/// Input for `EventsManager::update_event`. Each field uses one of:
+/// `None` (don't touch), `Some(value)` (set). Nullable fields use
+/// `Option<Option<T>>` so `Some(None)` clears the value. `span` controls
+/// whether the edit applies to just this occurrence or all future ones in
+/// a recurring series.
+#[derive(Debug, Clone, Default)]
+#[allow(non_snake_case)]
+pub struct EventPatch<'a> {
+    pub title: Option<&'a str>,
+    pub notes: Option<Option<&'a str>>,
+    pub location: Option<Option<&'a str>>,
+    pub start: Option<DateTime<Local>>,
+    pub end: Option<DateTime<Local>>,
+    pub all_day: Option<bool>,
+    /// Move to a different calendar by title.
+    pub calendar_title: Option<&'a str>,
+    pub URL: Option<Option<&'a str>>,
+    pub availability: Option<EventAvailability>,
+    pub structured_location: Option<Option<&'a StructuredLocation>>,
+    /// `This` (default) edits only this occurrence; `Future` propagates.
+    pub span: EventSpan,
 }
 
 /// The events manager providing access to Calendar events via EventKit
@@ -1401,49 +2372,52 @@ impl EventsManager {
         Ok(items)
     }
 
-    /// Creates a new event
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_event(
-        &self,
-        title: &str,
-        start: DateTime<Local>,
-        end: DateTime<Local>,
-        notes: Option<&str>,
-        location: Option<&str>,
-        calendar_title: Option<&str>,
-        all_day: bool,
-    ) -> Result<EventItem> {
+    /// Creates a new event. Build the input with `EventDraft` — only
+    /// `title`, `start`, and `end` are required; spread `..Default::default()`
+    /// for the rest.
+    pub fn create_event(&self, draft: &EventDraft<'_>) -> Result<EventItem> {
         self.ensure_authorized()?;
+
+        let start = draft.start.ok_or(EventKitError::InvalidDateRange)?;
+        let end = draft.end.ok_or(EventKitError::InvalidDateRange)?;
 
         let event = unsafe { EKEvent::eventWithEventStore(&self.store) };
 
-        // Set title
-        let ns_title = NSString::from_str(title);
+        let ns_title = NSString::from_str(draft.title);
         unsafe { event.setTitle(Some(&ns_title)) };
 
-        // Set dates
         let start_date = datetime_to_nsdate(start);
         let end_date = datetime_to_nsdate(end);
         unsafe {
             event.setStartDate(Some(&start_date));
             event.setEndDate(Some(&end_date));
-            event.setAllDay(all_day);
+            event.setAllDay(draft.all_day);
         }
 
-        // Set notes if provided
-        if let Some(notes_text) = notes {
+        if let Some(notes_text) = draft.notes {
             let ns_notes = NSString::from_str(notes_text);
             unsafe { event.setNotes(Some(&ns_notes)) };
         }
 
-        // Set location if provided
-        if let Some(loc) = location {
+        if let Some(loc) = draft.location {
             let ns_location = NSString::from_str(loc);
             unsafe { event.setLocation(Some(&ns_location)) };
         }
 
-        // Set calendar
-        let calendar = if let Some(cal_title) = calendar_title {
+        if draft.URL.is_some() {
+            set_item_URL(&event, draft.URL)?;
+        }
+
+        if let Some(av) = draft.availability {
+            unsafe { event.setAvailability(av.to_ek()) };
+        }
+
+        if let Some(sl) = draft.structured_location {
+            let built = build_ek_structured_location(sl);
+            unsafe { event.setStructuredLocation(Some(&built)) };
+        }
+
+        let calendar = if let Some(cal_title) = draft.calendar_title {
             self.find_calendar_by_title(cal_title)?
         } else {
             unsafe { self.store.defaultCalendarForNewEvents() }
@@ -1451,60 +2425,70 @@ impl EventsManager {
         };
         unsafe { event.setCalendar(Some(&calendar)) };
 
-        // Save
-        unsafe {
-            self.store
-                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
 
         Ok(event_to_item(&event))
     }
 
     /// Updates an existing event
-    pub fn update_event(
-        &self,
-        identifier: &str,
-        title: Option<&str>,
-        notes: Option<&str>,
-        location: Option<&str>,
-        start: Option<DateTime<Local>>,
-        end: Option<DateTime<Local>>,
-    ) -> Result<EventItem> {
+    /// Updates an existing event. Build the changeset with `EventPatch` —
+    /// only the fields you set are written. For nullable fields,
+    /// `Some(Some(v))` writes, `Some(None)` clears. `span` controls
+    /// whether the edit applies to just this occurrence or all future
+    /// occurrences in a recurring series.
+    pub fn update_event(&self, identifier: &str, patch: &EventPatch<'_>) -> Result<EventItem> {
         self.ensure_authorized()?;
 
         let event = self.find_event_by_id(identifier)?;
 
-        if let Some(t) = title {
+        if let Some(t) = patch.title {
             let ns_title = NSString::from_str(t);
             unsafe { event.setTitle(Some(&ns_title)) };
         }
 
-        if let Some(n) = notes {
-            let ns_notes = NSString::from_str(n);
-            unsafe { event.setNotes(Some(&ns_notes)) };
+        if let Some(notes_opt) = patch.notes {
+            let ns = notes_opt.map(NSString::from_str);
+            unsafe { event.setNotes(ns.as_deref()) };
         }
 
-        if let Some(l) = location {
-            let ns_location = NSString::from_str(l);
-            unsafe { event.setLocation(Some(&ns_location)) };
+        if let Some(loc_opt) = patch.location {
+            let ns = loc_opt.map(NSString::from_str);
+            unsafe { event.setLocation(ns.as_deref()) };
         }
 
-        if let Some(s) = start {
+        if let Some(s) = patch.start {
             let start_date = datetime_to_nsdate(s);
             unsafe { event.setStartDate(Some(&start_date)) };
         }
 
-        if let Some(e) = end {
+        if let Some(e) = patch.end {
             let end_date = datetime_to_nsdate(e);
             unsafe { event.setEndDate(Some(&end_date)) };
         }
 
-        unsafe {
-            self.store
-                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+        if let Some(ad) = patch.all_day {
+            unsafe { event.setAllDay(ad) };
         }
+
+        if let Some(url_opt) = patch.URL {
+            set_item_URL(&event, url_opt)?;
+        }
+
+        if let Some(av) = patch.availability {
+            unsafe { event.setAvailability(av.to_ek()) };
+        }
+
+        if let Some(sl_opt) = patch.structured_location {
+            let built = sl_opt.map(build_ek_structured_location);
+            unsafe { event.setStructuredLocation(built.as_deref()) };
+        }
+
+        if let Some(cal_title) = patch.calendar_title {
+            let calendar = self.find_calendar_by_title(cal_title)?;
+            unsafe { event.setCalendar(Some(&calendar)) };
+        }
+
+        self.save_event_and_refresh(&event, patch.span.to_ek())?;
 
         Ok(event_to_item(&event))
     }
@@ -1634,12 +2618,8 @@ impl EventsManager {
     pub fn add_event_alarm(&self, identifier: &str, alarm: &AlarmInfo) -> Result<()> {
         self.ensure_authorized()?;
         let event = self.find_event_by_id(identifier)?;
-        add_item_alarm(&event, alarm);
-        unsafe {
-            self.store
-                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        add_item_alarm(&event, alarm)?;
+        self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
         Ok(())
     }
 
@@ -1659,11 +2639,7 @@ impl EventsManager {
         self.ensure_authorized()?;
         let event = self.find_event_by_id(identifier)?;
         set_item_recurrence_rule(&event, rule);
-        unsafe {
-            self.store
-                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
         Ok(())
     }
 
@@ -1672,11 +2648,7 @@ impl EventsManager {
         self.ensure_authorized()?;
         let event = self.find_event_by_id(identifier)?;
         clear_item_recurrence_rules(&event);
-        unsafe {
-            self.store
-                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
         Ok(())
     }
 
@@ -1685,25 +2657,32 @@ impl EventsManager {
         self.ensure_authorized()?;
         let event = self.find_event_by_id(identifier)?;
         remove_item_alarm(&event, index)?;
-        unsafe {
-            self.store
-                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
         Ok(())
     }
 
     /// Set or clear the URL on an event.
-    pub fn set_event_url(&self, identifier: &str, url: Option<&str>) -> Result<()> {
+    #[allow(non_snake_case)]
+    pub fn set_event_URL(&self, identifier: &str, url: Option<&str>) -> Result<()> {
         self.ensure_authorized()?;
         let event = self.find_event_by_id(identifier)?;
-        set_item_url(&event, url);
-        unsafe {
-            self.store
-                .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
-                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
-        }
+        set_item_URL(&event, url)?;
+        self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
         Ok(())
+    }
+
+    /// Set the event's `availability` field. Controls how the event shows
+    /// on the timeline (Busy/Free/Tentative/Unavailable). Always uses
+    /// `EKSpan::ThisEvent` since availability is typically per-instance.
+    pub fn set_event_availability(
+        &self,
+        identifier: &str,
+        availability: EventAvailability,
+    ) -> Result<()> {
+        self.ensure_authorized()?;
+        let event = self.find_event_by_id(identifier)?;
+        unsafe { event.setAvailability(availability.to_ek()) };
+        self.save_event_and_refresh(&event, EKSpan::ThisEvent)
     }
 
     // Helper to find a calendar by title
@@ -1720,8 +2699,10 @@ impl EventsManager {
         Err(EventKitError::CalendarNotFound(title.to_string()))
     }
 
-    // Helper to find an event by identifier
+    // Helper to find an event by identifier. Refreshes sources first so we
+    // pick up edits made elsewhere (mirrors `RemindersManager::find_reminder_by_id`).
     fn find_event_by_id(&self, identifier: &str) -> Result<Retained<EKEvent>> {
+        unsafe { self.store.refreshSourcesIfNecessary() };
         let ns_id = NSString::from_str(identifier);
         let event = unsafe { self.store.eventWithIdentifier(&ns_id) };
 
@@ -1729,6 +2710,19 @@ impl EventsManager {
             Some(e) => Ok(e),
             None => Err(EventKitError::ItemNotFound(identifier.to_string())),
         }
+    }
+
+    /// Save an event under the given span + refresh sources so subsequent
+    /// reads see the just-committed state. All `pub fn` event save paths
+    /// route through here, mirroring `RemindersManager::save_reminder_and_refresh`.
+    fn save_event_and_refresh(&self, event: &EKEvent, span: EKSpan) -> Result<()> {
+        unsafe {
+            self.store
+                .saveEvent_span_commit_error(event, span, true)
+                .map_err(|e| EventKitError::SaveFailed(format!("{:?}", e)))?;
+            self.store.refreshSourcesIfNecessary();
+        }
+        Ok(())
     }
 }
 
@@ -1758,26 +2752,11 @@ fn event_to_item(event: &EKEvent) -> EventItem {
     let start_date = nsdate_to_datetime(&start_ns);
     let end_date = nsdate_to_datetime(&end_ns);
 
-    let url = get_item_url(event);
+    #[allow(non_snake_case)]
+    let URL = get_item_URL(event);
 
-    // Availability: -1=NotSupported, 0=Busy, 1=Free, 2=Tentative, 3=Unavailable
-    let avail = unsafe { event.availability() };
-    let availability = match avail.0 {
-        0 => EventAvailability::Busy,
-        1 => EventAvailability::Free,
-        2 => EventAvailability::Tentative,
-        3 => EventAvailability::Unavailable,
-        _ => EventAvailability::NotSupported,
-    };
-
-    // Status: 0=None, 1=Confirmed, 2=Tentative, 3=Canceled
-    let stat = unsafe { event.status() };
-    let status = match stat.0 {
-        1 => EventStatus::Confirmed,
-        2 => EventStatus::Tentative,
-        3 => EventStatus::Canceled,
-        _ => EventStatus::None,
-    };
+    let availability = EventAvailability::from_ek(unsafe { event.availability() });
+    let status = EventStatus::from_ek(unsafe { event.status() });
 
     let is_detached = unsafe { event.isDetached() };
     let occurrence_date = unsafe { event.occurrenceDate() }.map(|d| nsdate_to_datetime(&d));
@@ -1808,6 +2787,14 @@ fn event_to_item(event: &EKEvent) -> EventItem {
     // Organizer (event-only)
     let organizer = unsafe { event.organizer() }.map(|p| participant_to_info(&p));
 
+    // EKCalendarItem-inherited read fields (parity with ReminderItem)
+    let creation_date = unsafe { event.creationDate() }.map(|d| nsdate_to_datetime(&d));
+    let last_modified_date = unsafe { event.lastModifiedDate() }.map(|d| nsdate_to_datetime(&d));
+    let external_identifier =
+        unsafe { event.calendarItemExternalIdentifier() }.map(|s| s.to_string());
+    let timezone = unsafe { event.timeZone() }.map(|tz| tz.name().to_string());
+    let attachments_count = get_item_attachments_count(event);
+
     EventItem {
         identifier,
         title,
@@ -1818,12 +2805,17 @@ fn event_to_item(event: &EKEvent) -> EventItem {
         all_day,
         calendar_title,
         calendar_id,
-        url,
+        URL,
         availability,
         status,
         is_detached,
         occurrence_date,
         structured_location,
+        creation_date,
+        last_modified_date,
+        external_identifier,
+        timezone,
+        attachments_count,
         attendees,
         organizer,
     }
@@ -1846,7 +2838,8 @@ fn get_item_attendees(item: &EKCalendarItem) -> Vec<ParticipantInfo> {
 // Convert an EKParticipant to ParticipantInfo
 fn participant_to_info(p: &objc2_event_kit::EKParticipant) -> ParticipantInfo {
     let name = unsafe { p.name() }.map(|n| n.to_string());
-    let url = unsafe { p.URL() }.absoluteString().map(|s| s.to_string());
+    #[allow(non_snake_case)]
+    let URL = unsafe { p.URL() }.absoluteString().map(|s| s.to_string());
 
     // Role: 0=Unknown, 1=Required, 2=Optional, 3=Chair, 4=NonParticipant
     let role = unsafe { p.participantRole() };
@@ -1876,7 +2869,7 @@ fn participant_to_info(p: &objc2_event_kit::EKParticipant) -> ParticipantInfo {
 
     ParticipantInfo {
         name,
-        url,
+        URL,
         role,
         status,
         is_current_user,
@@ -1941,9 +2934,10 @@ fn get_item_alarms(item: &EKCalendarItem) -> Vec<AlarmInfo> {
 }
 
 /// Add an alarm to a calendar item.
-fn add_item_alarm(item: &EKCalendarItem, alarm: &AlarmInfo) {
-    let ek_alarm = create_ek_alarm(alarm);
+fn add_item_alarm(item: &EKCalendarItem, alarm: &AlarmInfo) -> Result<()> {
+    let ek_alarm = create_ek_alarm(alarm)?;
     unsafe { item.addAlarm(&ek_alarm) };
+    Ok(())
 }
 
 /// Remove an alarm from a calendar item by index.
@@ -1998,19 +2992,143 @@ fn clear_item_recurrence_rules(item: &EKCalendarItem) {
 }
 
 /// Set URL on a calendar item.
-fn set_item_url(item: &EKCalendarItem, url: Option<&str>) {
-    unsafe {
-        let ns_url = url.map(|u| {
-            let ns_str = NSString::from_str(u);
-            objc2_foundation::NSURL::URLWithString(&ns_str).unwrap()
-        });
-        item.setURL(ns_url.as_deref());
-    }
+///
+/// Uses `+[NSURL URLWithString:encodingInvalidCharacters:NO]` for strict
+/// RFC 3986 validation — returns `Err(InvalidURL)` if the string isn't a
+/// well-formed URL instead of silently auto-encoding or panicking.
+#[allow(non_snake_case)]
+fn set_item_URL(item: &EKCalendarItem, url: Option<&str>) -> Result<()> {
+    let ns_url = match url {
+        None => None,
+        Some(s) => {
+            let ns_str = NSString::from_str(s);
+            let parsed =
+                objc2_foundation::NSURL::URLWithString_encodingInvalidCharacters(&ns_str, false);
+            match parsed {
+                Some(u) => Some(u),
+                None => return Err(EventKitError::InvalidURL(s.to_string())),
+            }
+        }
+    };
+    unsafe { item.setURL(ns_url.as_deref()) };
+    Ok(())
 }
 
 /// Read URL from a calendar item.
-fn get_item_url(item: &EKCalendarItem) -> Option<String> {
+#[allow(non_snake_case)]
+fn get_item_URL(item: &EKCalendarItem) -> Option<String> {
     unsafe { item.URL() }.map(|u| u.absoluteString().unwrap().to_string())
+}
+
+/// Set the free-text `location` on a calendar item. Pass `None` to clear.
+///
+/// iCloud caveat: on iCloud-synced reminder lists the string `location`
+/// property may silently revert to null even though `setLocation:` returns
+/// success and the save commits. iCloud Reminders treats the location as a
+/// derived view of `structuredLocation` set via a location-based alarm.
+/// To attach a location that survives iCloud sync, use
+/// `RemindersManager::set_geofence` (or pass `geofence` to a `ReminderDraft`).
+fn set_item_location(item: &EKCalendarItem, location: Option<&str>) {
+    match location {
+        Some(text) => {
+            let ns_loc = NSString::from_str(text);
+            unsafe { item.setLocation(Some(&ns_loc)) };
+        }
+        None => unsafe { item.setLocation(None) },
+    }
+}
+
+/// Set the timezone applied to the reminder's due date. EventKit derives
+/// `EKReminder.dueDateTimeZone` from `dueDateComponents.timeZone` (the
+/// `dueDateTimeZone` property is readonly), so the setter mutates the
+/// components and re-assigns them. Pass `None` to clear.
+///
+/// No-op if the reminder has no due date yet — without `dueDateComponents`
+/// there's nothing to hang the timezone on. Callers that want a timezone-
+/// scoped reminder should set the due date first.
+fn set_reminder_due_date_timezone(reminder: &EKReminder, tz_name: Option<&str>) {
+    use objc2_foundation::NSTimeZone;
+    let Some(components) = (unsafe { reminder.dueDateComponents() }) else {
+        return;
+    };
+    let tz = tz_name.and_then(|n| {
+        let ns_n = NSString::from_str(n);
+        NSTimeZone::timeZoneWithName(&ns_n)
+    });
+    components.setTimeZone(tz.as_deref());
+    unsafe { reminder.setDueDateComponents(Some(&components)) };
+}
+
+/// Set or clear the reminder's own `structuredLocation` — the iCloud-native
+/// location chip Reminders.app reads/writes. Pass `None` to clear.
+///
+/// Uses `msg_send!` because `objc2-event-kit` 0.3 didn't generate
+/// `setStructuredLocation:` on `EKCalendarItem` / `EKReminder` (only on
+/// `EKEvent` and `EKAlarm`). The method exists at runtime — confirmed via
+/// `class_copyMethodList`.
+fn set_reminder_structured_location(reminder: &EKReminder, loc: Option<&StructuredLocation>) {
+    use objc2::msg_send;
+    let ek = loc.map(build_ek_structured_location);
+    // EKCalendarItem exposes both — try the no-prediction variant first
+    // (skips iCloud's "smart suggest based on title" pass), then the plain
+    // setter. On iCloud-synced reminder lists the underlying daemon
+    // silently drops both mutations; the alarm-based path (`set_geofence`)
+    // is the only persistence route iCloud honors. We still call these
+    // setters because local/CalDAV reminder sources accept them.
+    let _: () =
+        unsafe { msg_send![reminder, setStructuredLocationWithoutPrediction: ek.as_deref()] };
+    let _: () = unsafe { msg_send![reminder, setStructuredLocation: ek.as_deref()] };
+}
+
+/// Build an `EKStructuredLocation` from our plain `StructuredLocation`.
+/// Geo coordinates only set when the `location` feature is on (CoreLocation).
+fn build_ek_structured_location(loc: &StructuredLocation) -> Retained<EKStructuredLocation> {
+    let title = NSString::from_str(&loc.title);
+    let structured = unsafe { EKStructuredLocation::locationWithTitle(&title) };
+    unsafe { structured.setRadius(loc.radius) };
+    #[cfg(feature = "location")]
+    {
+        use objc2::AnyThread;
+        use objc2_core_location::CLLocation;
+        let cl = unsafe {
+            CLLocation::initWithLatitude_longitude(CLLocation::alloc(), loc.latitude, loc.longitude)
+        };
+        unsafe { structured.setGeoLocation(Some(&cl)) };
+    }
+    structured
+}
+
+/// Attach (or replace) a location-based alarm on the reminder. EventKit has
+/// no `structuredLocation` directly on `EKCalendarItem`/`EKReminder` — the
+/// geofence lives on an `EKAlarm` with `proximity`. Passing `None` clears
+/// every proximity-bearing alarm.
+fn set_reminder_geofence(
+    reminder: &EKReminder,
+    geofence: Option<(&StructuredLocation, AlarmProximity)>,
+) {
+    // Strip existing location-based alarms — leave time-based alarms alone.
+    if let Some(alarms) = unsafe { reminder.alarms() } {
+        for i in (0..alarms.len()).rev() {
+            let alarm = alarms.objectAtIndex(i);
+            if unsafe { alarm.proximity() } != EKAlarmProximity::None {
+                unsafe { reminder.removeAlarm(&alarm) };
+            }
+        }
+    }
+
+    let Some((loc, proximity)) = geofence else {
+        return;
+    };
+
+    let info = AlarmInfo {
+        relative_offset: Some(0.0),
+        proximity,
+        location: Some(loc.clone()),
+        ..Default::default()
+    };
+    // safe to expect — info has no `url`, the only field that can fail to parse
+    let alarm = create_ek_alarm(&info).expect("geofence alarm has no URL to parse");
+    unsafe { reminder.addAlarm(&alarm) };
 }
 
 // ============================================================================
@@ -2053,14 +3171,21 @@ fn recurrence_rule_to_info(rule: &EKRecurrenceRule) -> RecurrenceRule {
         result
     });
 
-    let days_of_month = unsafe { rule.daysOfTheMonth() }.map(|days| {
-        let mut result = Vec::new();
-        for i in 0..days.len() {
-            let num = days.objectAtIndex(i);
-            result.push(num.intValue());
-        }
-        result
-    });
+    fn nsnumber_array_to_vec(arr: Option<Retained<NSArray<NSNumber>>>) -> Option<Vec<i32>> {
+        arr.map(|days| {
+            let mut result = Vec::with_capacity(days.len());
+            for i in 0..days.len() {
+                result.push(days.objectAtIndex(i).intValue());
+            }
+            result
+        })
+    }
+
+    let days_of_month = nsnumber_array_to_vec(unsafe { rule.daysOfTheMonth() });
+    let months_of_year = nsnumber_array_to_vec(unsafe { rule.monthsOfTheYear() });
+    let weeks_of_year = nsnumber_array_to_vec(unsafe { rule.weeksOfTheYear() });
+    let days_of_year = nsnumber_array_to_vec(unsafe { rule.daysOfTheYear() });
+    let set_positions = nsnumber_array_to_vec(unsafe { rule.setPositions() });
 
     RecurrenceRule {
         frequency,
@@ -2068,6 +3193,10 @@ fn recurrence_rule_to_info(rule: &EKRecurrenceRule) -> RecurrenceRule {
         end,
         days_of_week,
         days_of_month,
+        months_of_year,
+        weeks_of_year,
+        days_of_year,
+        set_positions,
     }
 }
 
@@ -2101,15 +3230,31 @@ fn create_ek_recurrence_rule(rule: &RecurrenceRule) -> Retained<EKRecurrenceRule
                 .collect()
         });
 
-    let days_of_month: Option<Vec<Retained<NSNumber>>> = rule
-        .days_of_month
-        .as_ref()
-        .map(|days| days.iter().map(|&d| NSNumber::new_i32(d)).collect());
+    fn vec_to_nsnumber_array(v: Option<&Vec<i32>>) -> Option<Vec<Retained<NSNumber>>> {
+        v.map(|nums| nums.iter().map(|&n| NSNumber::new_i32(n)).collect())
+    }
+    let days_of_month = vec_to_nsnumber_array(rule.days_of_month.as_ref());
+    let months_of_year = vec_to_nsnumber_array(rule.months_of_year.as_ref());
+    let weeks_of_year = vec_to_nsnumber_array(rule.weeks_of_year.as_ref());
+    let days_of_year = vec_to_nsnumber_array(rule.days_of_year.as_ref());
+    let set_positions = vec_to_nsnumber_array(rule.set_positions.as_ref());
 
     let days_of_week_arr = days_of_week
         .as_ref()
         .map(|v| NSArray::from_retained_slice(v));
     let days_of_month_arr = days_of_month
+        .as_ref()
+        .map(|v| NSArray::from_retained_slice(v));
+    let months_of_year_arr = months_of_year
+        .as_ref()
+        .map(|v| NSArray::from_retained_slice(v));
+    let weeks_of_year_arr = weeks_of_year
+        .as_ref()
+        .map(|v| NSArray::from_retained_slice(v));
+    let days_of_year_arr = days_of_year
+        .as_ref()
+        .map(|v| NSArray::from_retained_slice(v));
+    let set_positions_arr = set_positions
         .as_ref()
         .map(|v| NSArray::from_retained_slice(v));
 
@@ -2121,10 +3266,10 @@ fn create_ek_recurrence_rule(rule: &RecurrenceRule) -> Retained<EKRecurrenceRule
             rule.interval as isize,
             days_of_week_arr.as_deref(),
             days_of_month_arr.as_deref(),
-            None, // months of year
-            None, // weeks of year
-            None, // days of year
-            None, // set positions
+            months_of_year_arr.as_deref(),
+            weeks_of_year_arr.as_deref(),
+            days_of_year_arr.as_deref(),
+            set_positions_arr.as_deref(),
             end.as_deref(),
         )
     }
@@ -2162,17 +3307,38 @@ fn alarm_to_info(alarm: &EKAlarm) -> AlarmInfo {
         }
     });
 
+    let email_address = unsafe { alarm.emailAddress() }.map(|s| s.to_string());
+    let sound_name = unsafe { alarm.soundName() }.map(|s| s.to_string());
+    #[allow(deprecated)]
+    let url = unsafe { alarm.url() }
+        .as_ref()
+        .and_then(|u| u.absoluteString())
+        .map(|s| s.to_string());
+
+    let alarm_type = match unsafe { alarm.r#type() } {
+        EKAlarmType::Display => AlarmType::Display,
+        EKAlarmType::Audio => AlarmType::Audio,
+        EKAlarmType::Procedure => AlarmType::Procedure,
+        EKAlarmType::Email => AlarmType::Email,
+        _ => AlarmType::Unknown,
+    };
+
     AlarmInfo {
         // relativeOffset of 0 means "at time of event" — it's always set
         relative_offset: Some(relative_offset),
         absolute_date,
         proximity,
         location,
+        email_address,
+        sound_name,
+        url,
+        alarm_type,
     }
 }
 
-// Helper to create an EKAlarm from an AlarmInfo
-fn create_ek_alarm(info: &AlarmInfo) -> Retained<EKAlarm> {
+// Helper to create an EKAlarm from an AlarmInfo. Returns Err if the
+// caller-supplied `url` isn't a valid RFC 3986 URL.
+fn create_ek_alarm(info: &AlarmInfo) -> Result<Retained<EKAlarm>> {
     let alarm = if let Some(date) = &info.absolute_date {
         let nsdate = datetime_to_nsdate(*date);
         unsafe { EKAlarm::alarmWithAbsoluteDate(&nsdate) }
@@ -2181,7 +3347,6 @@ fn create_ek_alarm(info: &AlarmInfo) -> Retained<EKAlarm> {
         unsafe { EKAlarm::alarmWithRelativeOffset(offset) }
     };
 
-    // Set proximity
     let prox = match info.proximity {
         AlarmProximity::Enter => EKAlarmProximity::Enter,
         AlarmProximity::Leave => EKAlarmProximity::Leave,
@@ -2189,36 +3354,100 @@ fn create_ek_alarm(info: &AlarmInfo) -> Retained<EKAlarm> {
     };
     unsafe { alarm.setProximity(prox) };
 
-    // Set structured location if provided
     if let Some(loc) = &info.location {
-        let title = NSString::from_str(&loc.title);
-        let structured = unsafe { EKStructuredLocation::locationWithTitle(&title) };
-        unsafe { structured.setRadius(loc.radius) };
-
-        // Create CLLocation for the geo coordinates
-        #[cfg(feature = "location")]
-        {
-            use objc2::AnyThread;
-            use objc2_core_location::CLLocation;
-            let cl_location = unsafe {
-                CLLocation::initWithLatitude_longitude(
-                    CLLocation::alloc(),
-                    loc.latitude,
-                    loc.longitude,
-                )
-            };
-            unsafe { structured.setGeoLocation(Some(&cl_location)) };
-        }
-
+        let structured = build_ek_structured_location(loc);
         unsafe { alarm.setStructuredLocation(Some(&structured)) };
     }
 
-    alarm
+    // Apple infers EKAlarmType from which of these are set:
+    //   soundName → Audio, url → Procedure, emailAddress → Email, else Display.
+    if let Some(email) = &info.email_address {
+        let ns = NSString::from_str(email);
+        unsafe { alarm.setEmailAddress(Some(&ns)) };
+    }
+    if let Some(sound) = &info.sound_name {
+        let ns = NSString::from_str(sound);
+        unsafe { alarm.setSoundName(Some(&ns)) };
+    }
+    if let Some(u) = &info.url {
+        let ns_str = NSString::from_str(u);
+        let parsed =
+            objc2_foundation::NSURL::URLWithString_encodingInvalidCharacters(&ns_str, false)
+                .ok_or_else(|| EventKitError::InvalidURL(u.clone()))?;
+        #[allow(deprecated)]
+        unsafe {
+            alarm.setUrl(Some(&parsed))
+        };
+    }
+
+    Ok(alarm)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_span_default_is_this_and_maps_to_ek() {
+        assert_eq!(EventSpan::default(), EventSpan::This);
+        assert_eq!(EventSpan::This.to_ek(), EKSpan::ThisEvent);
+        assert_eq!(EventSpan::Future.to_ek(), EKSpan::FutureEvents);
+    }
+
+    #[test]
+    fn event_availability_round_trips_every_variant() {
+        for v in [
+            EventAvailability::NotSupported,
+            EventAvailability::Busy,
+            EventAvailability::Free,
+            EventAvailability::Tentative,
+            EventAvailability::Unavailable,
+        ] {
+            assert_eq!(EventAvailability::from_ek(v.to_ek()), v);
+        }
+    }
+
+    #[test]
+    fn event_status_from_ek_covers_each_variant() {
+        assert_eq!(EventStatus::from_ek(EKEventStatus::None), EventStatus::None);
+        assert_eq!(
+            EventStatus::from_ek(EKEventStatus::Confirmed),
+            EventStatus::Confirmed
+        );
+        assert_eq!(
+            EventStatus::from_ek(EKEventStatus::Tentative),
+            EventStatus::Tentative
+        );
+        assert_eq!(
+            EventStatus::from_ek(EKEventStatus::Canceled),
+            EventStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn event_draft_default_has_empty_title_and_zero_dates() {
+        // Documents that defaults aren't valid for actually creating —
+        // callers must populate title/start/end. Just confirms the struct
+        // builds with `..Default::default()` so the call sites can use it.
+        let d: EventDraft<'_> = EventDraft::default();
+        assert_eq!(d.title, "");
+        assert!(d.start.is_none());
+        assert!(d.end.is_none());
+        assert!(!d.all_day);
+        assert!(d.URL.is_none());
+        assert!(d.availability.is_none());
+    }
+
+    #[test]
+    fn event_patch_default_touches_nothing() {
+        let p: EventPatch<'_> = EventPatch::default();
+        assert!(p.title.is_none());
+        assert!(p.notes.is_none());
+        assert!(p.URL.is_none());
+        assert!(p.availability.is_none());
+        assert!(p.all_day.is_none());
+        assert_eq!(p.span, EventSpan::This);
+    }
 
     #[test]
     fn test_authorization_status_display() {
@@ -2244,12 +3473,17 @@ mod tests {
             all_day: false,
             calendar_title: None,
             calendar_id: None,
-            url: None,
+            URL: None,
             availability: EventAvailability::Busy,
             status: EventStatus::None,
             is_detached: false,
             occurrence_date: None,
             structured_location: None,
+            creation_date: None,
+            last_modified_date: None,
+            external_identifier: None,
+            timezone: None,
+            attachments_count: 0,
             attendees: Vec::new(),
             organizer: None,
         };

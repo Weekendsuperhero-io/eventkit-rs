@@ -14,6 +14,11 @@ jobs:
       check-os-json: '["macos-26"]'
       rust-cache-provider: github
       docs-os: macos-26
+      # Run tests via nextest with our `ci` profile (.config/nextest.toml).
+      # Parity with `./ci-check.sh` locally; honors the `live-eventkit`
+      # serial group + slow-timeout settings. `#[ignore]`d live tests stay
+      # skipped — they need real Calendar consent and can't run on a runner.
+      test-command: cargo install cargo-nextest --locked --quiet && cargo nextest run --all-features --profile ci
       build-matrix-json: >-
         [
           {"os":"macos-26","target":"x86_64-apple-darwin"},

@@ -52,7 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 embed_plist = "1.2"
-objc2 = "0.6"
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-core-graphics = { version = "0.3", features = ["CGColor"] }
 objc2-core-location = { version = "0.3", features = [
   "CLLocation",

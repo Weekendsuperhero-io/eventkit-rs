@@ -132,8 +132,8 @@ fn mcp_initialize_and_list_tools_does_not_panic() {
     c.initialize();
     let tools = c.list_tools();
     assert!(
-        tools.len() >= 27,
-        "expected at least 27 tools, got {}: {:?}",
+        tools.len() >= 32,
+        "expected at least 32 tools, got {}: {:?}",
         tools.len(),
         tools.iter().map(|t| t["name"].as_str()).collect::<Vec<_>>()
     );
@@ -183,6 +183,72 @@ fn mcp_auth_status_returns_valid_structured_response() {
     // remediation is Option<String>; either absent or a non-empty string.
     if let Some(r) = structured.get("remediation").and_then(Value::as_str) {
         assert!(!r.is_empty(), "remediation present but empty");
+    }
+}
+
+#[test]
+fn mcp_event_tools_are_registered() {
+    // Event-side parity check: every new event tool from the 1–8 plan must
+    // show up in tools/list. Catches accidental tool deletion or rename.
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let tools = c.list_tools();
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for expected in [
+        "list_events",
+        "create_event",
+        "update_event",
+        "delete_event",
+        "get_event",
+        "list_calendars",
+        "create_event_calendar",
+        "update_event_calendar",
+        "delete_event_calendar",
+        "set_event_availability",
+        "get_default_event_calendar",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing tool {expected:?} in tools/list. Got: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn mcp_update_event_schema_includes_new_fields() {
+    // Schema drift catcher: if someone renames a field on UpdateEventRequest
+    // the input schema changes and this fires.
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let tools = c.list_tools();
+    let update_event = tools
+        .iter()
+        .find(|t| t["name"].as_str() == Some("update_event"))
+        .expect("update_event tool missing");
+    let props = &update_event["inputSchema"]["properties"];
+    assert!(
+        props.is_object(),
+        "update_event inputSchema.properties missing: {update_event}"
+    );
+    for field in [
+        "title",
+        "notes",
+        "location",
+        "start",
+        "end",
+        "all_day",
+        "calendar_name",
+        "URL",
+        "availability",
+        "structured_location",
+        "span",
+        "alarms",
+        "recurrence",
+    ] {
+        assert!(
+            props.get(field).is_some(),
+            "update_event inputSchema missing field {field:?}; got: {props}"
+        );
     }
 }
 
