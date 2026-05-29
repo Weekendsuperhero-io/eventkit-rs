@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **MCP Server** — added `auth_status` and `request_access` tools, tools to set due timezone, geofence, and event availability, and embedded `Info.plist` to trigger macOS TCC privacy prompts.
+- **EventKit Core** — exposed `URL`, `availability`, `structured_location`, `due_date_timezone`, and `attachments_count`, and added support for raw reflection via `dump_reminder_raw` and `dump_reminder_private`.
+- **Testing** — added live EventKit tests and MCP smoke tests.
+
+### Changed
+- **Dependencies** — updated to support RMCP 1.4.
+- **EventKit Core** — refactored creation and updates to use `Draft` and `Patch` structs.
+- **Error messages** — enhanced authorization error messages with TCC remediation steps.
+- **CI & Infrastructure** — migrated testing from `cargo test` to `cargo nextest`.
+
 ### Changed
 - **Dependencies** — bumped `rmcp` to v1.4 and refactored the codebase to accommodate new macro and async transport usage.
 - **Documentation** — refreshed project documentation in `README.md`.
