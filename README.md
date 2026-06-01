@@ -1,3 +1,7 @@
+---
+created: 2026-05-29T04:27
+updated: 2026-05-29T04:27
+---
 # eventkit-rs
 
 [![Crates.io](https://img.shields.io/crates/v/eventkit-rs.svg)](https://crates.io/crates/eventkit-rs)

@@ -1,3 +1,7 @@
+---
+created: 2026-05-29T04:27
+updated: 2026-05-29T04:27
+---
 # Changelog
 
 All notable changes to this project will be documented in this file.

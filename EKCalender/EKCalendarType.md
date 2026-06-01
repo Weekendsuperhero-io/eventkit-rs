@@ -1,14 +1,15 @@
 ---
-title: "EKCalendarType"
-source: "https://developer.apple.com/documentation/eventkit/ekcalendartype?language=objc"
+title: EKCalendarType
+source: https://developer.apple.com/documentation/eventkit/ekcalendartype?language=objc
 author:
 published:
 created: 2026-05-26
-description: "Possible calendar types."
+description: Possible calendar types.
 tags:
   - “ical"
   - “calendar"
   - “constants"
+updated: 2026-05-29T04:27
 ---
 ```
 enum EKCalendarType : NSInteger;
