@@ -1003,13 +1003,16 @@ impl RemindersManager {
         if geofence.is_some() {
             use crate::location::{LocationAuthorizationStatus as L, LocationManager};
             let loc_mgr = LocationManager::new();
-            if loc_mgr.authorization_status() == L::NotDetermined {
+            let status = if loc_mgr.authorization_status() == L::NotDetermined {
                 loc_mgr.request_when_in_use_authorization();
                 // CLLocationManager delivers the result asynchronously on the
-                // run loop. Match the polling pattern get_current_location uses.
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            match loc_mgr.authorization_status() {
+                // run loop. Pump it and wait for the user to answer the dialog
+                // instead of bailing while the prompt is still on screen.
+                loc_mgr.wait_for_authorization(std::time::Duration::from_secs(60))
+            } else {
+                loc_mgr.authorization_status()
+            };
+            match status {
                 L::Authorized => {}
                 L::Denied => return Err(EventKitError::AuthorizationDenied),
                 L::Restricted => return Err(EventKitError::AuthorizationRestricted),

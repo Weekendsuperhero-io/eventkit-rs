@@ -64,6 +64,42 @@ impl LocationManager {
         }
     }
 
+    /// Block until the location authorization status is resolved (the user
+    /// dismisses the permission dialog) or `timeout` elapses.
+    ///
+    /// `requestWhenInUseAuthorization` only *presents* the dialog; the user's
+    /// choice is delivered asynchronously on the thread's run loop, and the
+    /// cached status read by `authorization_status()` doesn't change until that
+    /// callback is serviced. EventKit's own access requests use a completion
+    /// block + condvar, but `CLLocationManager` has no completion-block API — it
+    /// reports back through its delegate on the run loop. So we pump the current
+    /// thread's run loop (the handlers run off the main thread, where nothing is
+    /// pumping it) and re-read the status until it leaves `NotDetermined`.
+    ///
+    /// Returns the resolved status; still `NotDetermined` if the user never
+    /// answered before the timeout.
+    pub fn wait_for_authorization(&self, timeout: Duration) -> LocationAuthorizationStatus {
+        use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSRunLoop};
+
+        let start = std::time::Instant::now();
+        loop {
+            let status = self.authorization_status();
+            if status != LocationAuthorizationStatus::NotDetermined {
+                return status;
+            }
+            if start.elapsed() >= timeout {
+                return status;
+            }
+            // Run the run loop for up to 100ms so CoreLocation can deliver the
+            // authorization-change callback. `runMode:beforeDate:` returns early
+            // if an input source fires, so this is responsive yet not a busy loop.
+            unsafe {
+                let until = NSDate::dateWithTimeIntervalSinceNow(0.1);
+                NSRunLoop::currentRunLoop().runMode_beforeDate(NSDefaultRunLoopMode, &until);
+            }
+        }
+    }
+
     /// Get the most recently cached location without starting updates.
     ///
     /// Returns `None` if no location has been determined yet.
@@ -84,10 +120,16 @@ impl LocationManager {
         match self.authorization_status() {
             LocationAuthorizationStatus::NotDetermined => {
                 self.request_when_in_use_authorization();
-                // Give the system a moment to process the authorization request
-                std::thread::sleep(Duration::from_millis(500));
-                if self.authorization_status() != LocationAuthorizationStatus::Authorized {
-                    return Err(EventKitError::AuthorizationDenied);
+                // Wait for the user to actually answer the permission dialog
+                // rather than bailing while it's still on screen.
+                match self.wait_for_authorization(Duration::from_secs(60)) {
+                    LocationAuthorizationStatus::Authorized => {}
+                    LocationAuthorizationStatus::Restricted => {
+                        return Err(EventKitError::AuthorizationRestricted);
+                    }
+                    // Denied, or still NotDetermined because the user ignored
+                    // the dialog until it timed out.
+                    _ => return Err(EventKitError::AuthorizationDenied),
                 }
             }
             LocationAuthorizationStatus::Denied => {
