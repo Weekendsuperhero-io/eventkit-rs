@@ -34,7 +34,7 @@ thiserror = "2"
 
 # Optional cross-platform dependencies (gated behind features)
 anyhow = { version = "1", optional = true }
-rmcp = { version = "1.7", features = [
+rmcp = { version = "=1.7.0", features = [
   # `macros` + `server` come from rmcp defaults; `transport-async-rw` is
   # transitively pulled by `transport-io`. Only `transport-io` is needed
   # to expose `rmcp::transport::stdio()` for the standalone `--mcp`
@@ -42,6 +42,7 @@ rmcp = { version = "1.7", features = [
   # `app-api/src/gateway.rs`, since DuplexStream implements AsyncRead+Write).
   "transport-io",
 ], optional = true }
+rmcp-macros = "=1.7.0"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tokio = { version = "1.52", features = ["full"], optional = true }
