@@ -21,14 +21,15 @@
 
 use eventkit::{AuthorizationStatus, RemindersManager};
 
-/// Skip rather than fail when the host lacks Full Access — CI and a dev
-/// machine that hasn't granted Reminders should not report a red suite.
-fn require_full_access() -> bool {
-    if RemindersManager::authorization_status() == AuthorizationStatus::FullAccess {
-        return true;
-    }
-    eprintln!("SKIP: Reminders Full Access not granted on this host");
-    false
+/// The tests are `#[ignore]`d, so CI and a normal run never reach this; asked
+/// for, they need Full Access, and without it they fail rather than pass
+/// having checked nothing.
+fn require_full_access() {
+    assert_eq!(
+        RemindersManager::authorization_status(),
+        AuthorizationStatus::FullAccess,
+        "Reminders Full Access is not granted on this host"
+    );
 }
 
 /// A cached store MUST observe an external write.
@@ -43,9 +44,7 @@ fn require_full_access() -> bool {
 #[test]
 #[ignore = "needs Reminders full access; adds a real reminder"]
 fn live_eventkit_store_cache_sees_external_writes() {
-    if !require_full_access() {
-        return;
-    }
+    require_full_access();
 
     // Warm this thread's cached store and take a baseline.
     let manager = RemindersManager::new();
@@ -94,9 +93,7 @@ fn live_eventkit_store_cache_sees_external_writes() {
 #[test]
 #[ignore = "needs Reminders full access"]
 fn live_eventkit_store_cache_reuses_one_store_per_thread() {
-    if !require_full_access() {
-        return;
-    }
+    require_full_access();
     let a = RemindersManager::new();
     let b = RemindersManager::new();
     assert!(
