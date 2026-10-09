@@ -87,7 +87,7 @@ fn base_draft<'a>(title: &'a str) -> EventDraft<'a> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_create_with_all_fields() {
     let g = TestCalendarGuard::new();
     let mgr = g.manager();
@@ -138,7 +138,7 @@ fn live_eventkit_create_with_all_fields() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_update_title_and_notes() {
     let g = TestCalendarGuard::new();
     let mgr = g.manager();
@@ -161,7 +161,7 @@ fn live_eventkit_update_title_and_notes() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_update_all_day_toggle() {
     let g = TestCalendarGuard::new();
     let mgr = g.manager();
@@ -193,7 +193,7 @@ fn live_eventkit_update_all_day_toggle() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_set_event_availability_each_variant() {
     let g = TestCalendarGuard::new();
     let mgr = g.manager();
@@ -225,7 +225,7 @@ fn live_eventkit_set_event_availability_each_variant() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_update_structured_location() {
     let g = TestCalendarGuard::new();
     let mgr = g.manager();
@@ -255,7 +255,7 @@ fn live_eventkit_update_structured_location() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_update_span_future_propagates() {
     let g = TestCalendarGuard::new();
     let mgr = g.manager();
@@ -291,7 +291,7 @@ fn live_eventkit_update_span_future_propagates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_delete_span_future() {
     let g = TestCalendarGuard::new();
     let mgr = g.manager();
@@ -315,7 +315,7 @@ fn live_eventkit_delete_span_future() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_update_calendar_move() {
     // Tests EventPatch.calendar_title (move event to another calendar).
     // Requires a second calendar; create one ad-hoc, clean both up.
@@ -358,7 +358,7 @@ fn live_eventkit_update_calendar_move() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_refresh_after_save_visible_across_managers() {
     // The save_event_and_refresh helper should make a just-saved event
     // visible to a freshly-constructed `EventsManager` instance in the same
@@ -391,7 +391,7 @@ fn live_eventkit_refresh_after_save_visible_across_managers() {
 /// `AUTHORIZATION_PLAN.md`), and this method pokes far more obscure corners than
 /// that one did. Reaching the assertions at all is the result under test.
 #[test]
-#[ignore]
+#[ignore = "needs Calendar full access; writes to a real calendar"]
 fn live_eventkit_dump_event_private_survives_a_real_event() {
     let g = TestCalendarGuard::new();
     let mgr = g.manager();

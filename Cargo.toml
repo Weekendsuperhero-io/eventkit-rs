@@ -124,3 +124,7 @@ mcp = [
   "dep:tracing-subscriber"
 ]
 reminders = []
+
+[lints.clippy]
+# An ignored test says why it is ignored and what it needs to run.
+ignore_without_reason = "deny"

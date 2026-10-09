@@ -41,7 +41,7 @@ fn require_full_access() -> bool {
 /// If this fails, the thread-local cache is serving stale reads and the
 /// `EKEventStoreChanged` observer stops being optional.
 #[test]
-#[ignore]
+#[ignore = "needs Reminders full access; adds a real reminder"]
 fn live_eventkit_store_cache_sees_external_writes() {
     if !require_full_access() {
         return;
@@ -92,7 +92,7 @@ fn live_eventkit_store_cache_sees_external_writes() {
 /// Repeated `RemindersManager::new()` must retain ONE store per thread — the
 /// point of the cache. Pointer identity, not timing, so it's deterministic.
 #[test]
-#[ignore]
+#[ignore = "needs Reminders full access"]
 fn live_eventkit_store_cache_reuses_one_store_per_thread() {
     if !require_full_access() {
         return;
