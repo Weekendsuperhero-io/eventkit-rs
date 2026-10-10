@@ -28,7 +28,7 @@ A Rust library and CLI for interacting with macOS Calendar events and Reminders 
 ## Requirements
 
 - macOS 14+ (Sonoma)
-- Rust 1.94+
+- Rust 1.99+
 
 ## Installation
 
