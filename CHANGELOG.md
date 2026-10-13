@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T04:27
-updated: 2026-10-10T00:00
+updated: 2026-10-13T00:00
 ---
 # Changelog
 
@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Rust 1.99 or newer** (`rust-version`), the toolchain Agent Muse builds with.
+
+### Removed
+- **MCP tasks (SEP-1686), version 0.7.0** — the server no longer advertises
+  `capabilities.tasks`; `list_reminders`, `list_events`, `search`,
+  `batch_delete`, `batch_move` and `batch_update` no longer declare
+  `execution.taskSupport`; and `tasks/list`, `tasks/get`, `tasks/result` and
+  `tasks/cancel` are gone, with the `notifications/tasks/status` push and the
+  task manager behind them (`mcp_tasks.rs`). Agent Muse, which embeds this
+  server, measured the task surface unused (no task-augmented call, no
+  `tasks/*` request in two weeks of traffic), and every rmcp 3.x release
+  removes the MCP 2025-11-25 task model. A task-augmented `tools/call` is
+  refused and the tool does not run. EventKit calls stay synchronous on the
+  handler's own thread. The `tokio-util` and `uuid` dependencies went with
+  it. Tasks may return as the SEP-2663 extension. A breaking change, hence
+  the minor version bump.
 
 ## [0.6.0] - 2026-08-04
 

@@ -2,7 +2,7 @@
 
 [package]
 name = "eventkit-rs"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "A Rust library and CLI for managing macOS Calendar events and Reminders via EventKit"
 documentation = "https://docs.rs/eventkit-rs"
@@ -49,9 +49,6 @@ rmcp = { version = "=2.2.0", features = [
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tokio = { version = "1.52", features = ["full"], optional = true }
-# MCP task surface (SEP-1686): cancellation tokens + task identifiers.
-tokio-util = { version = "0.7", optional = true }
-uuid = { version = "1", features = ["v4"], optional = true }
 # NOT optional: `imp.rs` logs unconditionally (a `--no-default-features
 # --features reminders` build failed to compile before this). `tracing` is a
 # facade — with no subscriber installed the macros compile to near-nothing.
@@ -119,8 +116,6 @@ mcp = [
   "dep:serde",
   "dep:serde_json",
   "dep:tokio",
-  "dep:tokio-util",
-  "dep:uuid",
   "dep:tracing-subscriber"
 ]
 reminders = []
