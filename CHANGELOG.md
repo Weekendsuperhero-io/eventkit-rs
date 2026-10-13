@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Rust 1.99 or newer** (`rust-version`), the toolchain Agent Muse builds with.
+- **`rmcp` 2.2.0 → 3.5.1**, exact-pinned to the embedding Agent Muse
+  workspace's copy, so the app links one rmcp.
+- **MCP 2025-11-25, by decision** — the server speaks 2025-11-25 and every
+  earlier revision, and nothing newer, whatever rmcp calls latest (3.5.0 made
+  that 2026-07-28). A client asking for 2026-07-28 is answered in 2025-11-25.
+  `server/discover` (2026-07-28) is refused with `-32022` listing the versions
+  spoken, or with method-not-found at a 2025 version, so a probing client falls
+  back to `initialize`.
 
 ### Removed
 - **MCP tasks (SEP-1686), version 0.7.0** — the server no longer advertises
@@ -23,8 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task manager behind them (`mcp_tasks.rs`). Agent Muse, which embeds this
   server, measured the task surface unused (no task-augmented call, no
   `tasks/*` request in two weeks of traffic), and every rmcp 3.x release
-  removes the MCP 2025-11-25 task model. A task-augmented `tools/call` is
-  refused and the tool does not run. EventKit calls stay synchronous on the
+  removes the MCP 2025-11-25 task model. A task-augmented `tools/call` runs as
+  a plain call, the spec's rule for a server without the capability. EventKit
+  calls stay synchronous on the
   handler's own thread. The `tokio-util` and `uuid` dependencies went with
   it. Tasks may return as the SEP-2663 extension. A breaking change, hence
   the minor version bump.

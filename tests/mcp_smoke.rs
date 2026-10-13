@@ -402,12 +402,14 @@ fn mcp_does_not_advertise_tasks() {
     );
 }
 
-/// A task-augmented `tools/call` is REFUSED and the tool never runs: a client
-/// MUST NOT send one to a server that declares no tasks, and on rmcp 2.2 one
-/// that does is answered with an error. `auth_status` needs no EventKit
-/// access, so had it run it would have produced a RESULT.
+/// A task-augmented `tools/call` RUNS as a plain call. The server declares no
+/// tasks, and the 2025-11-25 spec says a receiver without the capability
+/// "MUST process requests of that type normally, ignoring any
+/// task-augmentation metadata"; rmcp 3.x does so by construction (its call
+/// params have no `task` field). rmcp 2.2 refused it with an error.
+/// `auth_status` needs no EventKit access, so the run is a plain RESULT.
 #[test]
-fn mcp_refuses_a_task_augmented_call() {
+fn mcp_runs_a_task_augmented_call_as_a_plain_call() {
     let mut c = McpClient::spawn();
     c.initialize();
     let resp = c.request(
@@ -419,7 +421,61 @@ fn mcp_refuses_a_task_augmented_call() {
         }),
     );
     assert!(
-        resp.get("error").is_some() && resp.get("result").is_none(),
-        "a task-augmented call must be refused, not run: {resp}"
+        resp.get("error").is_none() && resp["result"]["content"].is_array(),
+        "a task-augmented call must run as a plain call: {resp}"
+    );
+    assert!(
+        resp["result"].get("task").is_none(),
+        "the answer is a CallToolResult, not a task handle: {resp}"
+    );
+}
+
+/// The probe a 2026-07-28 client opens with: `server/discover` carrying its
+/// version, identity and capabilities in `_meta`.
+fn discover_probe(version: &str) -> Value {
+    json!({"_meta": {
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }})
+}
+
+/// An `initialize` asking for 2026-07-28 is answered in 2025-11-25, the
+/// revision this server speaks, rather than agreed to because rmcp knows it.
+#[test]
+fn mcp_negotiates_a_2026_07_28_client_down_to_2025_11_25() {
+    let mut c = McpClient::spawn();
+    let resp = c.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        }),
+    );
+    assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp}");
+}
+
+/// A 2026-07-28 probe is refused `-32022` with ONLY the versions this server
+/// speaks, which a probing client reads as "legacy, use `initialize`". A probe
+/// at a 2025 version is told the method does not exist. Then the legacy
+/// handshake still works on the same pipe, which is the fallback.
+#[test]
+fn mcp_server_discover_lists_only_versions_up_to_2025_11_25() {
+    let mut c = McpClient::spawn();
+    let resp = c.request("server/discover", discover_probe("2026-07-28"));
+    assert_eq!(resp["error"]["code"], -32022, "{resp}");
+    assert_eq!(
+        resp["error"]["data"]["supported"],
+        json!(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]),
+    );
+
+    let resp = c.request("server/discover", discover_probe("2025-11-25"));
+    assert_eq!(resp["error"]["code"], -32601, "{resp}");
+
+    c.initialize();
+    assert!(
+        !c.list_tools().is_empty(),
+        "the fallback session serves tools"
     );
 }

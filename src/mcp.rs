@@ -20,6 +20,12 @@ use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone};
 
 use rmcp::handler::server::wrapper::Json;
 
+/// The MCP revision this server speaks: 2025-11-25, by decision rather than
+/// whatever the SDK calls latest. rmcp's `Default` follows its `LATEST`, which
+/// is 2026-07-28 from 3.5.0 on, a revision whose lifecycle this server has not
+/// adopted (the embedding Agent Muse workspace's bridge D41).
+const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
 // ============================================================================
 // Structured Output Types
 // ============================================================================
@@ -2945,16 +2951,40 @@ impl EventKitServer {
 #[tool_handler]
 #[prompt_handler]
 impl rmcp::ServerHandler for EventKitServer {
-    fn get_info(&self) -> ServerInfo {
+    /// Every revision up to `PROTOCOL_VERSION` and nothing newer. rmcp's
+    /// default is every version it knows, 2026-07-28 included, so
+    /// `server/discover` would advertise it and `initialize` would agree to
+    /// it. This one list bounds discovery, the handshake and the version a
+    /// request names in its own `_meta`.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&PROTOCOL_VERSION))
+    }
+
+    /// `server/discover` does not exist in 2025-11-25, so it is answered as a
+    /// 2025-11-25 server answers it. A probe at 2026-07-28 never gets here:
+    /// rmcp refuses it first with `-32022` and the list above, which a probing
+    /// client reads as "legacy, use `initialize`". A probe at a 2025 version
+    /// does, and rmcp's default would answer it with a discover result and let
+    /// the client run the 2026 stateless lifecycle at a 2025 version.
+    async fn discover(
+        &self,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        Err(McpError::method_not_found::<DiscoverRequestMethod>())
+    }
+
+    fn get_info(&self) -> ServerConfig {
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
             .build();
-        ServerInfo::new(capabilities).with_instructions(
-            "This MCP server provides access to macOS Calendar events and Reminders. \
+        ServerConfig::new(capabilities)
+            .with_protocol_version(PROTOCOL_VERSION)
+            .with_instructions(
+                "This MCP server provides access to macOS Calendar events and Reminders. \
              Use the available tools to list, create, update, and delete calendar events \
              and reminders. Authorization is handled automatically on first use.",
-        )
+            )
     }
 }
 
