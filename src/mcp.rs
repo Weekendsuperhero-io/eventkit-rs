@@ -15,10 +15,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-#[path = "mcp_tasks.rs"]
-mod tasks;
-use tasks::{ManagedTask, TaskCompletion, TaskFailureGuard, TaskManager};
-
 #[path = "mcp_thread.rs"]
 mod eventkit_thread;
 
@@ -1248,19 +1244,17 @@ pub struct CreateReminderPromptArgs {
 /// moved to one thread. So keep EventKit calls synchronous and inside the
 /// handler, and **never** move them to another thread: not
 /// `tokio::task::spawn_blocking` (a pool of up to 512 threads), not
-/// `std::thread::spawn`, not a runtime of their own. A handler slow enough to
-/// need backgrounding uses the MCP task surface
-/// (`execution(task_support = "optional")` + `enqueue_task`), whose worker calls
-/// `call_tool` and so lands on the EventKit thread too.
+/// `std::thread::spawn`, not a runtime of their own. Slow handlers included:
+/// the MCP task surface (SEP-1686) that used to move slow work onto another
+/// worker was retired in 0.7.0 — it was measured unused, and rmcp 3.x removes
+/// it. A slow handler stays synchronous; if it has to show it is alive, it
+/// reports `notifications/progress` between EventKit calls, holding no
+/// EventKit value across that `.await`.
 #[derive(Clone)]
-pub struct EventKitServer {
-    /// Background tasks this server owns (SEP-1686).
-    ///
-    /// `Arc<Mutex<..>>` keeps `EventKitServer: Send + Sync + Clone`, which the
-    /// `!Send` invariant above depends on — the manager never holds an
-    /// EventKit object, only ids, statuses and join handles.
-    task_manager: std::sync::Arc<parking_lot::Mutex<TaskManager>>,
-}
+// Constructed only through `new()` / `Default`, as when it carried a field, so
+// state can be added back later without a breaking change.
+#[non_exhaustive]
+pub struct EventKitServer {}
 
 impl Default for EventKitServer {
     fn default() -> Self {
@@ -1296,9 +1290,7 @@ fn parse_datetime(s: &str) -> Result<DateTime<Local>, String> {
 #[allow(non_snake_case)]
 impl EventKitServer {
     pub fn new() -> Self {
-        Self {
-            task_manager: std::sync::Arc::new(parking_lot::Mutex::new(TaskManager::new())),
-        }
+        Self {}
     }
 
     // ========================================================================
@@ -1389,8 +1381,7 @@ impl EventKitServer {
             title = "List Reminders",
             read_only_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn list_reminders(
         &self,
@@ -1953,8 +1944,7 @@ impl EventKitServer {
 
     #[tool(
         description = "List calendar events. By default shows today's events. Can specify a date range.",
-        annotations(title = "List Events", read_only_hint = true, open_world_hint = false),
-        execution(task_support = "optional")
+        annotations(title = "List Events", read_only_hint = true, open_world_hint = false)
     )]
     async fn list_events(
         &self,
@@ -2328,8 +2318,7 @@ impl EventKitServer {
 
     #[tool(
         description = "Search reminders or events by text in title or notes (case-insensitive). Specify item_type to filter, or omit to search both.",
-        annotations(title = "Search", read_only_hint = true, open_world_hint = false),
-        execution(task_support = "optional")
+        annotations(title = "Search", read_only_hint = true, open_world_hint = false)
     )]
     async fn search(
         &self,
@@ -2410,8 +2399,7 @@ impl EventKitServer {
             destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn batch_delete(
         &self,
@@ -2467,8 +2455,7 @@ impl EventKitServer {
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn batch_move(
         &self,
@@ -2517,8 +2504,7 @@ impl EventKitServer {
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn batch_update(
         &self,
@@ -2979,8 +2965,7 @@ impl rmcp::ServerHandler for EventKitServer {
     // Every tool call and prompt runs on the one EventKit thread
     // (`mcp_thread.rs`), so the process holds one EKEventStore. These two
     // replace what the macros would generate, which run the routers on
-    // whichever worker rmcp's request task landed on. A task-augmented call
-    // comes through here too: `enqueue_task`'s worker calls `call_tool`.
+    // whichever worker rmcp's request task landed on.
 
     async fn call_tool(
         &self,
@@ -3029,168 +3014,11 @@ impl rmcp::ServerHandler for EventKitServer {
         })
     }
 
-    // ── MCP tasks (SEP-1686) ────────────────────────────────────────────
-    //
-    // Some EventKit work is slow enough that a host may time the call out: a
-    // full-calendar scan, or a `batch_*` over hundreds of items. Tools that
-    // declare `execution(task_support = "optional")` can be invoked
-    // task-augmented — this returns a task id immediately and runs the work in
-    // the background.
-    //
-    // Unlike most MCP task servers, this one PUSHES: every status transition
-    // sends `notifications/tasks/status` to the caller, so a task-aware client
-    // never has to poll to discover the work finished.
-
-    async fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CreateTaskResult, McpError> {
-        // Hold the manager lock across BOTH admission and insertion, below.
-        // The worker's only interactions with the manager — its own transition
-        // and its failure guard's — take this same lock, so neither can run
-        // before the task is registered. Without that ordering, a worker that
-        // panicked in the window between `spawn` and `insert` would transition
-        // a task that did not exist yet, and the entry inserted a moment later
-        // would sit in `Working` forever. Holding one lock also closes the gap
-        // where two concurrent enqueues both passed `admit`.
-        let mut tasks = self.task_manager.lock();
-        tasks.admit()?;
-
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let now = tasks::now_iso8601();
-        let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
-            .with_poll_interval(1000);
-
-        let completion = std::sync::Arc::new(TaskCompletion::new());
-        let worker_completion = std::sync::Arc::clone(&completion);
-
-        // A child token so `tasks/cancel` can stop the work WITHOUT severing
-        // the transport cancellation this request already inherited.
-        let task_cancel = context.ct.child_token();
-        context.ct = task_cancel.clone();
-
-        let server = self.clone();
-        let peer = context.peer.clone();
-        let manager = std::sync::Arc::clone(&self.task_manager);
-        let worker_id = task_id.clone();
-
-        let guard = TaskFailureGuard::new(
-            worker_id.clone(),
-            std::sync::Arc::clone(&completion),
-            std::sync::Arc::clone(&manager),
-        );
-
-        let handle = tokio::spawn(async move {
-            // Armed until this worker reports for itself. `call_tool` can panic
-            // — objc2's non-null accessors abort on NULL, and several
-            // conversions unwrap on user data — and nothing here catches an
-            // unwind, so without the guard the task would never leave `Working`
-            // and its active slot would never be reclaimed.
-            let guard = guard;
-
-            let result = server.call_tool(request, context).await;
-            let failed = result.as_ref().map_or(true, |r| r.is_error == Some(true));
-            worker_completion.complete(result);
-
-            // Record the transition and push it. `transition` returns Some only
-            // on a REAL change, so a task cancelled a moment ago (already
-            // terminal) produces no second notification here.
-            let terminal = if failed {
-                TaskStatus::Failed
-            } else {
-                TaskStatus::Completed
-            };
-            let changed = manager.lock().transition(&worker_id, terminal);
-            guard.disarm();
-            if let Some(task) = changed {
-                let notification = ServerNotification::TaskStatusNotification(
-                    TaskStatusNotification::new(TaskStatusNotificationParam::new(task)),
-                );
-                // Fire-and-forget: a dead client must not be an error path.
-                if let Err(e) = peer.send_notification(notification).await {
-                    tracing::debug!(
-                        target: "eventkit",
-                        task = %worker_id,
-                        "tasks/status push failed — client gone: {e}"
-                    );
-                }
-            }
-        });
-
-        tasks.insert(
-            task_id,
-            ManagedTask::running(task.clone(), completion, task_cancel, handle),
-        );
-        drop(tasks);
-
-        Ok(CreateTaskResult::new(task))
-    }
-
-    async fn list_tasks(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<ListTasksResult, McpError> {
-        Ok(ListTasksResult::new(self.task_manager.lock().list_page()))
-    }
-
-    async fn get_task_info(
-        &self,
-        request: GetTaskParams,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<GetTaskResult, McpError> {
-        let task = self.task_manager.lock().task_info(&request.task_id)?;
-        Ok(GetTaskResult::new(task))
-    }
-
-    async fn get_task_result(
-        &self,
-        request: GetTaskPayloadParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<GetTaskPayloadResult, McpError> {
-        // Take the Arc, then DROP the manager lock before awaiting — holding a
-        // sync mutex across an await would block every other task operation for
-        // as long as this one waits.
-        let completion = self.task_manager.lock().completion(&request.task_id)?;
-        let result = completion.wait(&context.ct).await?;
-        let value = serde_json::to_value(result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(GetTaskPayloadResult::new(value))
-    }
-
-    async fn cancel_task(
-        &self,
-        request: CancelTaskParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CancelTaskResult, McpError> {
-        // The lock is released at the end of this statement, BEFORE the abort
-        // below — see `TaskManager::cancel_task` for why that ordering matters.
-        let (task, aborted) = self.task_manager.lock().cancel_task(&request.task_id)?;
-        if let Some(handle) = aborted {
-            handle.abort();
-        }
-        // Push the cancellation too — a client awaiting this task should learn
-        // from the notification stream, not only from the reply to its own call.
-        let notification = ServerNotification::TaskStatusNotification(TaskStatusNotification::new(
-            TaskStatusNotificationParam::new(task.clone()),
-        ));
-        let _ = context.peer.send_notification(notification).await;
-        Ok(CancelTaskResult::new(task))
-    }
-
     fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::builder()
+        let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
-            .enable_tasks()
             .build();
-        // `enable_tasks()` only flips the capability on. The protocol also wants
-        // the supported lifecycle methods and which requests may be
-        // task-augmented; `server_default()` is exactly
-        // `requests.tools.call` + `list` + `cancel`, which is what this server
-        // implements.
-        capabilities.tasks = Some(TasksCapability::server_default());
         ServerInfo::new(capabilities).with_instructions(
             "This MCP server provides access to macOS Calendar events and Reminders. \
              Use the available tools to list, create, update, and delete calendar events \
