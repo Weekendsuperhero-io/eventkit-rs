@@ -38,12 +38,15 @@ thiserror = "2"
 
 # Optional cross-platform dependencies (gated behind features)
 anyhow = { version = "1", optional = true }
-rmcp = { version = "=2.2.0", features = [
+# Exact-pinned to the embedding Agent Muse workspace's rmcp, so the app links
+# one copy. The protocol does not move with the SDK: it stays at MCP
+# 2025-11-25 (`mcp::PROTOCOL_VERSION`; the workspace's bridge D41).
+rmcp = { version = "=3.5.1", features = [
   # `macros` + `server` come from rmcp defaults; `transport-async-rw` is
   # transitively pulled by `transport-io`. Only `transport-io` is needed
   # to expose `rmcp::transport::stdio()` for the standalone `--mcp`
   # binary (also covers the in-process DuplexStream factory used by
-  # `app-api/src/gateway.rs`, since DuplexStream implements AsyncRead+Write).
+  # `app-api/src/bridge.rs`, since DuplexStream implements AsyncRead+Write).
   "transport-io",
 ], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
