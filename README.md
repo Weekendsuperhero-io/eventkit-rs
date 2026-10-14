@@ -187,7 +187,7 @@ eventkit dump events --days 30
 
 All tools return structured JSON with typed output schemas. Responses use `structured_content` (MCP spec 2025-06-18) with text fallback for older clients.
 
-**Protocol.** A 2025-era client opens with `initialize`, answered in 2025-11-25. A 2026-07-28 client runs that revision's stateless lifecycle: `server/discover` lists the revisions without a handshake, and each request carries its version, identity and capabilities in `_meta`.
+**Protocol.** A 2025-era client opens with `initialize`, answered in 2025-11-25. A 2026-07-28 client runs that revision's stateless lifecycle: `server/discover` lists every revision the server implements, and each request carries its version, identity and capabilities in `_meta`.
 
 **Tasks (SEP-2663).** The server offers the `io.modelcontextprotocol/tasks` extension and decides which calls become tasks: a call to `list_reminders`, `list_events`, `search`, the three batches, `request_access` or `get_current_location`, from a client that declared the extension, becomes one when it is still running after 1 second. The client gets a task handle and polls `tasks/get`; everything else is answered inline. At most 4 run at once, a task lives 1 hour, and `tasks/cancel` stops a batch between items (a single EventKit call runs to its end).
 
