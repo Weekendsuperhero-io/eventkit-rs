@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "eventkit-rs"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "block2",
@@ -289,6 +289,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

@@ -22,7 +22,7 @@ use std::future::Future;
 use std::sync::OnceLock;
 
 use tokio::runtime::Handle;
-use tokio::task::{AbortHandle, JoinError};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 
 /// The runtime on the EventKit thread. The thread starts on first use and
 /// lives as long as the process.
@@ -66,9 +66,21 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let task = handle().spawn(work);
+    let task = spawn(work);
     let _abort = AbortOnDrop(task.abort_handle());
     task.await
+}
+
+/// Start `work` on the EventKit thread and hand back its handle, for a caller
+/// that keeps the work past a single `.await`: a call that may become a task
+/// (`mcp_tasks.rs`). Dropping the handle does NOT stop the work, so that
+/// caller owns the abort.
+pub(super) fn spawn<F>(work: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    handle().spawn(work)
 }
 
 #[cfg(test)]
