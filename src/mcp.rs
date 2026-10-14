@@ -15,16 +15,22 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "mcp_tasks.rs"]
+mod tasks;
+
 use crate::{AuthorizationStatus, EventsManager, RemindersManager};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone};
 
 use rmcp::handler::server::wrapper::Json;
+use tokio_util::sync::CancellationToken;
 
-/// The MCP revision this server speaks: 2025-11-25, by decision rather than
-/// whatever the SDK calls latest. rmcp's `Default` follows its `LATEST`, which
-/// is 2026-07-28 from 3.5.0 on, a revision whose lifecycle this server has not
-/// adopted (the embedding Agent Muse workspace's bridge D41).
-const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+/// The newest MCP revision this server speaks. A 2025-era client still opens
+/// with `initialize`, answered in [`ProtocolVersion::LATEST_WITH_INITIALIZE`]
+/// (2025-11-25); a 2026-07-28 client runs that revision's stateless lifecycle,
+/// carrying its version, identity and capabilities in every request's `_meta`.
+/// Named rather than taken from rmcp's `LATEST`, so a newer SDK does not move
+/// the protocol on its own.
+const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 // ============================================================================
 // Structured Output Types
@@ -1250,17 +1256,19 @@ pub struct CreateReminderPromptArgs {
 /// (a fresh store per tool call), and routing EventKit work onto the blocking
 /// pool would reintroduce it at a worse scale.
 ///
-/// So: keep EventKit calls synchronous and on the handler's own thread — slow
-/// handlers included. The MCP task surface (SEP-1686) that used to move slow
-/// work onto another *worker* thread was retired in 0.7.0: it was measured
-/// unused, and rmcp 3.x removes it. A slow handler stays synchronous; if it has
-/// to show it is alive, it reports `notifications/progress` between EventKit
-/// calls, holding no EventKit value across that `.await`.
+/// So: keep EventKit calls synchronous and on a WORKER thread — slow handlers
+/// included. A slow call that becomes an MCP task (SEP-2663, see the `tasks`
+/// module) runs on its own tokio task, which is still a worker thread, so the
+/// store cache holds. If a handler has to show it is alive, it reports between
+/// EventKit calls, holding no EventKit value across an `.await`.
 #[derive(Clone)]
-// Constructed only through `new()` / `Default`, as when it carried a field, so
-// state can be added back later without a breaking change.
+// Constructed only through `new()` / `Default`, so state can be added without a
+// breaking change.
 #[non_exhaustive]
-pub struct EventKitServer {}
+pub struct EventKitServer {
+    /// This connection's tasks (SEP-2663).
+    tasks: std::sync::Arc<tasks::TaskRuntime>,
+}
 
 impl Default for EventKitServer {
     fn default() -> Self {
@@ -1296,7 +1304,13 @@ fn parse_datetime(s: &str) -> Result<DateTime<Local>, String> {
 #[allow(non_snake_case)]
 impl EventKitServer {
     pub fn new() -> Self {
-        Self {}
+        Self::with_tasks(tasks::TaskConfig::DEFAULT)
+    }
+
+    fn with_tasks(config: tasks::TaskConfig) -> Self {
+        Self {
+            tasks: std::sync::Arc::new(tasks::TaskRuntime::new(config)),
+        }
     }
 
     // ========================================================================
@@ -2409,48 +2423,30 @@ impl EventKitServer {
     )]
     async fn batch_delete(
         &self,
+        ct: CancellationToken,
         Parameters(params): Parameters<BatchDeleteRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let mut succeeded = 0usize;
-        let mut errors = Vec::new();
-
-        match params.item_type {
+        let response = match params.item_type {
             ItemType::Reminder => {
                 let manager = RemindersManager::new();
-                for id in &params.item_ids {
-                    match manager.delete_reminder(id) {
-                        Ok(_) => succeeded += 1,
-                        Err(e) => errors.push(format!("{id}: {e}")),
-                    }
-                }
+                run_batch(&params.item_ids, &ct, |id| {
+                    manager
+                        .delete_reminder(id)
+                        .map(drop)
+                        .map_err(|e| item_error(id, e))
+                })
             }
             ItemType::Event => {
                 let manager = EventsManager::new();
-                for id in &params.item_ids {
-                    match manager.delete_event(id, params.affect_future) {
-                        Ok(_) => succeeded += 1,
-                        Err(e) => errors.push(format!("{id}: {e}")),
-                    }
-                }
+                run_batch(&params.item_ids, &ct, |id| {
+                    manager
+                        .delete_event(id, params.affect_future)
+                        .map(drop)
+                        .map_err(|e| item_error(id, e))
+                })
             }
-        }
-
-        let err_items: Vec<_> = errors
-            .into_iter()
-            .map(|e| {
-                let (id, msg) = e.split_once(": ").unwrap_or(("unknown", &e));
-                BatchItemError {
-                    item_id: id.to_string(),
-                    message: msg.to_string(),
-                }
-            })
-            .collect();
-        Ok(Json(BatchResponse {
-            total: params.item_ids.len(),
-            succeeded,
-            failed: err_items.len(),
-            errors: err_items,
-        }))
+        };
+        Ok(Json(response))
     }
 
     #[tool(
@@ -2465,41 +2461,20 @@ impl EventKitServer {
     )]
     async fn batch_move(
         &self,
+        ct: CancellationToken,
         Parameters(params): Parameters<BatchMoveRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
         let manager = RemindersManager::new();
-        let mut succeeded = 0usize;
-        let mut errors = Vec::new();
-
-        for id in &params.reminder_ids {
-            match manager.update_reminder(
-                id,
-                &crate::ReminderPatch {
-                    calendar_title: Some(&params.destination_list_name),
-                    ..Default::default()
-                },
-            ) {
-                Ok(_) => succeeded += 1,
-                Err(e) => errors.push(format!("{id}: {e}")),
-            }
-        }
-
-        let err_items: Vec<_> = errors
-            .into_iter()
-            .map(|e| {
-                let (id, msg) = e.split_once(": ").unwrap_or(("unknown", &e));
-                BatchItemError {
-                    item_id: id.to_string(),
-                    message: msg.to_string(),
-                }
-            })
-            .collect();
-        Ok(Json(BatchResponse {
-            total: params.reminder_ids.len(),
-            succeeded,
-            failed: err_items.len(),
-            errors: err_items,
-        }))
+        let patch = crate::ReminderPatch {
+            calendar_title: Some(&params.destination_list_name),
+            ..Default::default()
+        };
+        Ok(Json(run_batch(&params.reminder_ids, &ct, |id| {
+            manager
+                .update_reminder(id, &patch)
+                .map(drop)
+                .map_err(|e| item_error(id, e))
+        })))
     }
 
     #[tool(
@@ -2514,81 +2489,100 @@ impl EventKitServer {
     )]
     async fn batch_update(
         &self,
+        ct: CancellationToken,
         Parameters(params): Parameters<BatchUpdateRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let mut succeeded = 0usize;
-        let mut errors = Vec::new();
-
-        match params.item_type {
+        let response = match params.item_type {
             ItemType::Reminder => {
                 let manager = RemindersManager::new();
-                for item in &params.updates {
+                run_batch(&params.updates, &ct, |item| {
                     let priority = item.priority.as_ref().map(Priority::to_usize);
                     let due_date = match &item.due_date {
                         Some(s) if s.is_empty() => Some(None),
-                        Some(s) => match parse_datetime_or_time(s) {
-                            Ok(dt) => Some(Some(dt)),
-                            Err(e) => {
-                                errors.push(format!("{}: {e}", item.item_id));
-                                continue;
-                            }
-                        },
+                        Some(s) => Some(Some(
+                            parse_datetime_or_time(s).map_err(|e| item_error(&item.item_id, e))?,
+                        )),
                         None => None,
                     };
-                    match manager.update_reminder(
-                        &item.item_id,
-                        &crate::ReminderPatch {
-                            title: item.title.as_deref(),
-                            notes: item.notes.as_deref(),
-                            completed: item.completed,
-                            priority,
-                            due_date,
-                            ..Default::default()
-                        },
-                    ) {
-                        Ok(_) => succeeded += 1,
-                        Err(e) => errors.push(format!("{}: {e}", item.item_id)),
-                    }
-                }
+                    manager
+                        .update_reminder(
+                            &item.item_id,
+                            &crate::ReminderPatch {
+                                title: item.title.as_deref(),
+                                notes: item.notes.as_deref(),
+                                completed: item.completed,
+                                priority,
+                                due_date,
+                                ..Default::default()
+                            },
+                        )
+                        .map(drop)
+                        .map_err(|e| item_error(&item.item_id, e))
+                })
             }
             ItemType::Event => {
                 let manager = EventsManager::new();
-                for item in &params.updates {
-                    match manager.update_event(
-                        &item.item_id,
-                        &crate::EventPatch {
-                            title: item.title.as_deref(),
-                            notes: item
-                                .notes
-                                .as_ref()
-                                .map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
-                            ..Default::default()
-                        },
-                    ) {
-                        Ok(_) => succeeded += 1,
-                        Err(e) => errors.push(format!("{}: {e}", item.item_id)),
-                    }
-                }
+                run_batch(&params.updates, &ct, |item| {
+                    manager
+                        .update_event(
+                            &item.item_id,
+                            &crate::EventPatch {
+                                title: item.title.as_deref(),
+                                notes: item
+                                    .notes
+                                    .as_ref()
+                                    .map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
+                                ..Default::default()
+                            },
+                        )
+                        .map(drop)
+                        .map_err(|e| item_error(&item.item_id, e))
+                })
             }
-        }
+        };
+        Ok(Json(response))
+    }
+}
 
-        let total = params.updates.len();
-        let err_items: Vec<_> = errors
-            .into_iter()
-            .map(|e| {
-                let (id, msg) = e.split_once(": ").unwrap_or(("unknown", &e));
-                BatchItemError {
-                    item_id: id.to_string(),
-                    message: msg.to_string(),
-                }
-            })
-            .collect();
-        Ok(Json(BatchResponse {
-            total,
-            succeeded,
-            failed: err_items.len(),
-            errors: err_items,
-        }))
+/// Apply one change per item, stopping between items when the call is
+/// cancelled (`tasks/cancel`, `notifications/cancelled`, or the connection
+/// closing). An EventKit call cannot be interrupted part-way, so between items
+/// is where a batch can stop. Once the call is a task, its status says how far
+/// the batch got.
+fn run_batch<T>(
+    items: &[T],
+    ct: &CancellationToken,
+    mut apply: impl FnMut(&T) -> Result<(), BatchItemError>,
+) -> BatchResponse {
+    let total = items.len();
+    let mut succeeded = 0usize;
+    let mut errors = Vec::new();
+    for (done, item) in items.iter().enumerate() {
+        if tasks::stop_requested(ct) {
+            tasks::report_status(format!(
+                "Stopped after {done} of {total}: {succeeded} succeeded, {} failed",
+                errors.len()
+            ));
+            break;
+        }
+        match apply(item) {
+            Ok(()) => succeeded += 1,
+            Err(error) => errors.push(error),
+        }
+        tasks::report_progress(done + 1, total);
+    }
+    BatchResponse {
+        total,
+        succeeded,
+        failed: errors.len(),
+        errors,
+    }
+}
+
+fn item_error(item_id: &str, error: impl std::fmt::Display) -> BatchItemError {
+    BatchItemError {
+        item_id: item_id.to_string(),
+        message: error.to_string(),
     }
 }
 
@@ -2951,35 +2945,108 @@ impl EventKitServer {
 #[tool_handler]
 #[prompt_handler]
 impl rmcp::ServerHandler for EventKitServer {
-    /// Every revision up to `PROTOCOL_VERSION` and nothing newer. rmcp's
-    /// default is every version it knows, 2026-07-28 included, so
-    /// `server/discover` would advertise it and `initialize` would agree to
-    /// it. This one list bounds discovery, the handshake and the version a
-    /// request names in its own `_meta`.
-    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&PROTOCOL_VERSION))
+    /// A call to one of the task tools from a client that declared the tasks
+    /// extension may become a task once it has run for a second (see the
+    /// `tasks` module). Every other call is dispatched exactly as the
+    /// generated handler did.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let tasks_declared = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        if !(tasks_declared && tasks::TASK_TOOLS.contains(&request.name.as_ref())) {
+            let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+            return Self::tool_router().call(call).await;
+        }
+        let operation_ct = self.tasks.operation_token();
+        let request_ct = std::mem::replace(&mut context.ct, operation_ct.clone());
+        let tool = request.name.clone();
+        let server = self.clone();
+        self.tasks
+            .run_call(&tool, request_ct, operation_ct, async move {
+                let call =
+                    rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
+                Self::tool_router().call(call).await
+            })
+            .await
     }
 
-    /// `server/discover` does not exist in 2025-11-25, so it is answered as a
-    /// 2025-11-25 server answers it. A probe at 2026-07-28 never gets here:
-    /// rmcp refuses it first with `-32022` and the list above, which a probing
-    /// client reads as "legacy, use `initialize`". A probe at a 2025 version
-    /// does, and rmcp's default would answer it with a discover result and let
-    /// the client run the 2026 stateless lifecycle at a 2025 version.
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.tasks.get(&request.task_id)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.update(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel(&request.task_id)
+    }
+
+    /// Every revision up to `MAX_PROTOCOL_VERSION` and nothing newer, so a
+    /// newer rmcp cannot widen what this server claims. This one list bounds
+    /// `server/discover`, the `initialize` negotiation and the version a
+    /// request names in its own `_meta`.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION))
+    }
+
+    /// `server/discover` opens the 2026-07-28 lifecycle, so it is answered
+    /// only at a revision without a handshake, and lists only those
+    /// revisions. A probe at a 2025 version is told the method does not
+    /// exist, which is how a 2025-11-25 server answers it: rmcp's default
+    /// would answer and let the client run the stateless lifecycle at a
+    /// revision that defines none. (A version this server does not speak at
+    /// all never gets here: rmcp refuses it with `-32022` first.)
     async fn discover(
         &self,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<DiscoverResult, McpError> {
-        Err(McpError::method_not_found::<DiscoverRequestMethod>())
+        if context
+            .meta
+            .protocol_version()
+            .is_none_or(|version| version.has_initialize())
+        {
+            return Err(McpError::method_not_found::<DiscoverRequestMethod>());
+        }
+        let stateless = self
+            .supported_protocol_versions()
+            .iter()
+            .filter(|version| !version.has_initialize())
+            .cloned()
+            .collect();
+        Ok(DiscoverResult::from_server_info(stateless, self.get_info()))
     }
 
     fn get_info(&self) -> ServerConfig {
+        // `tasks` is the SEP-2663 extension, offered on both revisions: only a
+        // slow call from a client that declared it ever becomes a task. The
+        // SEP-1686 `capabilities.tasks` slot retired in 0.7.0 stays gone.
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
+            .enable_tasks()
             .build();
         ServerConfig::new(capabilities)
-            .with_protocol_version(PROTOCOL_VERSION)
+            // The `initialize` answer: the newest revision that still has a
+            // handshake. rmcp answers a client asking for 2026-07-28 there
+            // with this too.
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
             .with_instructions(
                 "This MCP server provides access to macOS Calendar events and Reminders. \
              Use the available tools to list, create, update, and delete calendar events \
@@ -2996,9 +3063,20 @@ pub async fn serve_on<T>(transport: T) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let server = EventKitServer::new();
+    serve_server(transport, EventKitServer::new()).await
+}
+
+/// Serve one connection, then end its tasks: nothing can poll them once the
+/// client is gone.
+async fn serve_server<T>(transport: T, server: EventKitServer) -> anyhow::Result<()>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let tasks = std::sync::Arc::clone(&server.tasks);
     let service = server.serve(transport).await?;
-    service.waiting().await?;
+    let result = service.waiting().await;
+    tasks.shutdown().await;
+    result?;
     Ok(())
 }
 
@@ -3013,8 +3091,11 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
         .init();
 
     let server = EventKitServer::new();
+    let tasks = std::sync::Arc::clone(&server.tasks);
     let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+    let result = service.waiting().await;
+    tasks.shutdown().await;
+    result?;
     Ok(())
 }
 

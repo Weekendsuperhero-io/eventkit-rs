@@ -366,10 +366,11 @@ fn mcp_every_tool_is_annotated_and_coherent() {
     );
 }
 
-/// The SEP-1686 task surface was retired in 0.7.0 (measured unused; rmcp 3.x
-/// removes it), so the server must not advertise `tasks` at all.
+/// Tasks are the SEP-2663 extension (`capabilities.extensions`), never the
+/// SEP-1686 slot retired in 0.7.0, and no tool declares `execution`: the
+/// server decides which calls become tasks, the client does not ask per tool.
 #[test]
-fn mcp_does_not_advertise_tasks() {
+fn mcp_advertises_tasks_only_as_the_extension() {
     let mut c = McpClient::spawn();
     c.next_id += 1;
     let id = c.next_id;
@@ -388,7 +389,13 @@ fn mcp_does_not_advertise_tasks() {
     );
     assert!(
         resp["result"]["capabilities"].get("tasks").is_none(),
-        "`tasks` must not be advertised: {resp}"
+        "the v1 `tasks` slot must not be advertised: {resp}"
+    );
+    assert!(
+        resp["result"]["capabilities"]["extensions"]
+            .as_object()
+            .is_some_and(|extensions| extensions.contains_key("io.modelcontextprotocol/tasks")),
+        "the tasks extension is offered: {resp}"
     );
     let tools = c.list_tools();
     let declared: Vec<&str> = tools
@@ -402,12 +409,11 @@ fn mcp_does_not_advertise_tasks() {
     );
 }
 
-/// A task-augmented `tools/call` RUNS as a plain call. The server declares no
-/// tasks, and the 2025-11-25 spec says a receiver without the capability
-/// "MUST process requests of that type normally, ignoring any
-/// task-augmentation metadata"; rmcp 3.x does so by construction (its call
-/// params have no `task` field). rmcp 2.2 refused it with an error.
-/// `auth_status` needs no EventKit access, so the run is a plain RESULT.
+/// The SEP-1686 `task` parameter asks for nothing any more: SEP-2663 leaves
+/// the decision to the server, only for a client that declared the extension
+/// (this one did not), and `auth_status` is not a task tool anyway. So the
+/// call RUNS as a plain call. `auth_status` needs no EventKit access, so the
+/// run is a plain RESULT.
 #[test]
 fn mcp_runs_a_task_augmented_call_as_a_plain_call() {
     let mut c = McpClient::spawn();
@@ -430,18 +436,24 @@ fn mcp_runs_a_task_augmented_call_as_a_plain_call() {
     );
 }
 
+/// The `_meta` a 2026-07-28 client puts on every request: its version,
+/// identity and capabilities, since that revision has no handshake.
+fn stateless_meta(version: &str, capabilities: &Value) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": capabilities,
+    })
+}
+
 /// The probe a 2026-07-28 client opens with: `server/discover` carrying its
 /// version, identity and capabilities in `_meta`.
 fn discover_probe(version: &str) -> Value {
-    json!({"_meta": {
-        "io.modelcontextprotocol/protocolVersion": version,
-        "io.modelcontextprotocol/clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
-        "io.modelcontextprotocol/clientCapabilities": {},
-    }})
+    json!({ "_meta": stateless_meta(version, &json!({})) })
 }
 
-/// An `initialize` asking for 2026-07-28 is answered in 2025-11-25, the
-/// revision this server speaks, rather than agreed to because rmcp knows it.
+/// An `initialize` asking for 2026-07-28 is answered in 2025-11-25: that
+/// revision has no handshake, so the newest one with one is the answer.
 #[test]
 fn mcp_negotiates_a_2026_07_28_client_down_to_2025_11_25() {
     let mut c = McpClient::spawn();
@@ -456,20 +468,41 @@ fn mcp_negotiates_a_2026_07_28_client_down_to_2025_11_25() {
     assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp}");
 }
 
-/// A 2026-07-28 probe is refused `-32022` with ONLY the versions this server
-/// speaks, which a probing client reads as "legacy, use `initialize`". A probe
-/// at a 2025 version is told the method does not exist. Then the legacy
-/// handshake still works on the same pipe, which is the fallback.
+/// A 2026-07-28 probe opens that revision's lifecycle: `server/discover`
+/// answers with the revisions that need no handshake (only 2026-07-28), the
+/// tasks extension and this server's identity, and a request carrying its own
+/// `_meta`, with no `initialize` anywhere, is served in that revision's shape.
 #[test]
-fn mcp_server_discover_lists_only_versions_up_to_2025_11_25() {
+fn mcp_server_discover_at_2026_07_28_opens_the_stateless_lifecycle() {
     let mut c = McpClient::spawn();
     let resp = c.request("server/discover", discover_probe("2026-07-28"));
-    assert_eq!(resp["error"]["code"], -32022, "{resp}");
-    assert_eq!(
-        resp["error"]["data"]["supported"],
-        json!(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]),
+    let result = &resp["result"];
+    assert_eq!(result["supportedVersions"], json!(["2026-07-28"]), "{resp}");
+    assert!(
+        result["capabilities"]["extensions"]
+            .as_object()
+            .is_some_and(|extensions| extensions.contains_key("io.modelcontextprotocol/tasks")),
+        "{resp}"
     );
 
+    let resp = c.request(
+        "tools/list",
+        json!({ "_meta": stateless_meta("2026-07-28", &json!({})) }),
+    );
+    assert!(
+        resp["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "{resp}"
+    );
+    assert_eq!(resp["result"]["resultType"], "complete", "{resp}");
+}
+
+/// A probe at a 2025 version is told the method does not exist, and the
+/// handshake still works on the same pipe: that is the fallback.
+#[test]
+fn mcp_server_discover_at_a_2025_version_is_method_not_found() {
+    let mut c = McpClient::spawn();
     let resp = c.request("server/discover", discover_probe("2025-11-25"));
     assert_eq!(resp["error"]["code"], -32601, "{resp}");
 
@@ -478,4 +511,33 @@ fn mcp_server_discover_lists_only_versions_up_to_2025_11_25() {
         !c.list_tools().is_empty(),
         "the fallback session serves tools"
     );
+}
+
+/// A revision newer than 2026-07-28 is refused `-32022` with every version
+/// this server speaks.
+#[test]
+fn mcp_refuses_an_unknown_revision_with_the_supported_list() {
+    let mut c = McpClient::spawn();
+    let resp = c.request("server/discover", discover_probe("2099-01-01"));
+    assert_eq!(resp["error"]["code"], -32022, "{resp}");
+    assert_eq!(
+        resp["error"]["data"]["supported"],
+        json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]),
+    );
+}
+
+/// `tasks/*` belongs to clients that declared the extension: a session that
+/// did not is refused `-32021`.
+#[test]
+fn mcp_refuses_tasks_methods_without_the_extension() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let resp = c.request("tasks/get", json!({ "taskId": "nope" }));
+    assert_eq!(resp["error"]["code"], -32021, "{resp}");
 }

@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T04:27
-updated: 2026-05-29T04:27
+updated: 2026-10-14T00:00
 ---
 # eventkit-rs
 
@@ -15,7 +15,7 @@ A Rust library and CLI for interacting with macOS Calendar events and Reminders 
 
 - **Calendar Events** — full CRUD with alarms, recurrence (incl. `monthsOfTheYear` / `setPositions`), attendees, location chip, URL, structured location, availability (Busy/Free/Tentative/Unavailable), calendar move, and `EKSpan` choice (`this` vs `future`) for recurring edits/deletes.
 - **Reminders** — full CRUD with priority, alarms (time + geofence), recurrence (including `monthsOfTheYear` / `setPositions` etc.), due/start dates, due-date IANA timezone, and explicit completion-date setting.
-- **MCP Server** — built-in MCP server (`--mcp`) with structured JSON output, typed input/output schemas, and **32 tools**.
+- **MCP Server** — built-in MCP server (`--mcp`) with structured JSON output, typed input/output schemas, and **32 tools**. Speaks MCP 2026-07-28 (stateless) and 2025-11-25 (`initialize`); a slow call from a client that declared the SEP-2663 tasks extension becomes a task it polls.
 - **Calendar Management** — create, update (name + color), and delete both reminder lists and event calendars.
 - **Batch Operations** — batch delete, move, and update across reminders and events.
 - **Authorization** — programmatic consent prompts for Reminders, Calendar, and Location; status diagnostics with remediation hints.
@@ -186,6 +186,10 @@ eventkit dump events --days 30
 ## MCP Server
 
 All tools return structured JSON with typed output schemas. Responses use `structured_content` (MCP spec 2025-06-18) with text fallback for older clients.
+
+**Protocol.** A 2025-era client opens with `initialize`, answered in 2025-11-25. A 2026-07-28 client runs that revision's stateless lifecycle: `server/discover` lists the revisions without a handshake, and each request carries its version, identity and capabilities in `_meta`.
+
+**Tasks (SEP-2663).** The server offers the `io.modelcontextprotocol/tasks` extension and decides which calls become tasks: a call to `list_reminders`, `list_events`, `search`, the three batches, `request_access` or `get_current_location`, from a client that declared the extension, becomes one when it is still running after 1 second. The client gets a task handle and polls `tasks/get`; everything else is answered inline. At most 4 run at once, a task lives 1 hour, and `tasks/cancel` stops a batch between items (a single EventKit call runs to its end).
 
 ### Tools (32)
 

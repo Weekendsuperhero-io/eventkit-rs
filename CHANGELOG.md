@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T04:27
-updated: 2026-10-13T00:00
+updated: 2026-10-14T00:00
 ---
 # Changelog
 
@@ -11,16 +11,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **MCP tasks, as the SEP-2663 extension** (`io.modelcontextprotocol/tasks`,
+  offered on both revisions), version 0.8.0 — a call to `list_reminders`,
+  `list_events`, `search`, `batch_delete`, `batch_move`, `batch_update`,
+  `request_access` or `get_current_location` from a client that declared the
+  extension becomes a task when it is still running after 1 second: the client
+  gets a task handle at once and polls `tasks/get`. Quick calls, and every call
+  from a client that did not declare the extension, are answered inline as
+  before. Up to 4 tasks run at once (each holds a worker thread, since EventKit
+  calls stay synchronous and on worker threads) and 256 are held; a task lives
+  1 hour. A tool that panics fails its task instead of stranding it.
+- **Batches stop between items when cancelled** — `batch_delete`,
+  `batch_move` and `batch_update` check for cancellation (`tasks/cancel`,
+  `notifications/cancelled`, or the connection closing) before each item. A
+  cancelled batch task is `cancelled`, with a status saying how far it got;
+  while it runs, its status and `_meta["io.agentmuse/progress"]` on `tasks/get`
+  report items done out of the total. A single EventKit call cannot stop
+  part-way: a task cancelled during one is `completed`.
+
 ### Changed
 - **Rust 1.99 or newer** (`rust-version`), the toolchain Agent Muse builds with.
 - **`rmcp` 2.2.0 → 3.5.1**, exact-pinned to the embedding Agent Muse
   workspace's copy, so the app links one rmcp.
-- **MCP 2025-11-25, by decision** — the server speaks 2025-11-25 and every
-  earlier revision, and nothing newer, whatever rmcp calls latest (3.5.0 made
-  that 2026-07-28). A client asking for 2026-07-28 is answered in 2025-11-25.
-  `server/discover` (2026-07-28) is refused with `-32022` listing the versions
-  spoken, or with method-not-found at a 2025 version, so a probing client falls
-  back to `initialize`.
+- **MCP 2026-07-28 alongside 2025-11-25** — a 2026-07-28 client runs that
+  revision's stateless lifecycle: `server/discover` answers with the revisions
+  that need no handshake (2026-07-28 only), every request carries its own
+  version, identity and capabilities in `_meta`, and results carry
+  `resultType`. A 2025-era client still opens with `initialize`, answered in
+  2025-11-25 exactly as before, also when it asks for 2026-07-28.
+  `server/discover` at a 2025 version is method-not-found, so no client runs
+  the stateless lifecycle at a revision that defines none, and a revision
+  newer than 2026-07-28 is refused `-32022` with the list. The ceiling is named
+  (`MAX_PROTOCOL_VERSION`), never rmcp's `LATEST`.
 
 ### Removed
 - **MCP tasks (SEP-1686), version 0.7.0** — the server no longer advertises
@@ -35,8 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a plain call, the spec's rule for a server without the capability. EventKit
   calls stay synchronous on the
   handler's own thread. The `tokio-util` and `uuid` dependencies went with
-  it. Tasks may return as the SEP-2663 extension. A breaking change, hence
-  the minor version bump.
+  it. Tasks returned in 0.8.0 as the SEP-2663 extension (see Added), with
+  `tokio-util` for the operation tokens. A breaking change, hence the minor
+  version bump.
 
 ## [0.6.0] - 2026-08-04
 
