@@ -469,15 +469,26 @@ fn mcp_negotiates_a_2026_07_28_client_down_to_2025_11_25() {
 }
 
 /// A 2026-07-28 probe opens that revision's lifecycle: `server/discover`
-/// answers with the revisions that need no handshake (only 2026-07-28), the
-/// tasks extension and this server's identity, and a request carrying its own
+/// answers with every revision this server implements (the list a `-32022`
+/// carries too), the tasks extension and this server's identity, and a
+/// request carrying its own
 /// `_meta`, with no `initialize` anywhere, is served in that revision's shape.
 #[test]
 fn mcp_server_discover_at_2026_07_28_opens_the_stateless_lifecycle() {
     let mut c = McpClient::spawn();
     let resp = c.request("server/discover", discover_probe("2026-07-28"));
     let result = &resp["result"];
-    assert_eq!(result["supportedVersions"], json!(["2026-07-28"]), "{resp}");
+    assert_eq!(
+        result["supportedVersions"],
+        json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]),
+        "{resp}"
+    );
     assert!(
         result["capabilities"]["extensions"]
             .as_object()

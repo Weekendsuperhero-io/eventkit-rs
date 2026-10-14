@@ -43,8 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rmcp` 2.2.0 → 3.5.1**, exact-pinned to the embedding Agent Muse
   workspace's copy, so the app links one rmcp.
 - **MCP 2026-07-28 alongside 2025-11-25** — a 2026-07-28 client runs that
-  revision's stateless lifecycle: `server/discover` answers with the revisions
-  that need no handshake (2026-07-28 only), every request carries its own
+  revision's stateless lifecycle: `server/discover` answers with every
+  revision this server implements (the list a `-32022` carries too), every
+  request carries its own
   version, identity and capabilities in `_meta`, and results carry
   `resultType`. A 2025-era client still opens with `initialize`, answered in
   2025-11-25 exactly as before, also when it asks for 2026-07-28.

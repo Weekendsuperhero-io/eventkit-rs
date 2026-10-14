@@ -3075,12 +3075,17 @@ impl rmcp::ServerHandler for EventKitServer {
     }
 
     /// `server/discover` opens the 2026-07-28 lifecycle, so it is answered
-    /// only at a revision without a handshake, and lists only those
-    /// revisions. A probe at a 2025 version is told the method does not
-    /// exist, which is how a 2025-11-25 server answers it: rmcp's default
-    /// would answer and let the client run the stateless lifecycle at a
-    /// revision that defines none. (A version this server does not speak at
-    /// all never gets here: rmcp refuses it with `-32022` first.)
+    /// only at a revision without a handshake. A probe at a 2025 version is
+    /// told the method does not exist, which is how a 2025-11-25 server
+    /// answers it: rmcp's default would answer and let the client run the
+    /// stateless lifecycle at a revision that defines none. (A version this
+    /// server does not speak at all never gets here: rmcp refuses it with
+    /// `-32022` first.)
+    ///
+    /// `supportedVersions` lists every revision this server implements, the
+    /// same list a `-32022` carries: a client must be able to read the two
+    /// answers as one fact (the official suite's `sep-2575` checks hold
+    /// them to it).
     async fn discover(
         &self,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
@@ -3092,13 +3097,10 @@ impl rmcp::ServerHandler for EventKitServer {
         {
             return Err(McpError::method_not_found::<DiscoverRequestMethod>());
         }
-        let stateless = self
-            .supported_protocol_versions()
-            .iter()
-            .filter(|version| !version.has_initialize())
-            .cloned()
-            .collect();
-        Ok(DiscoverResult::from_server_info(stateless, self.get_info()))
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
     }
 
     fn get_info(&self) -> ServerConfig {
