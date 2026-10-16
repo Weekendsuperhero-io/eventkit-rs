@@ -424,13 +424,28 @@ fn wait_for_completion<T>(
 /// hold one across an `.await`, which is what makes the generated futures
 /// `Send` and lets the server run on a normal multi-thread tokio runtime
 /// without rmcp's `local` feature. A thread-local keeps that invariant intact
-/// while still amortising construction: one store per worker thread instead of
-/// one per call.
+/// while still amortising construction: one store per thread instead of one
+/// per call. In the MCP server that is one store in all, because every tool
+/// call runs on the EventKit thread (`mcp_thread.rs`).
+///
+/// The one store serves reminders and events alike, as Apple's single
+/// instance does. Each kind has its own authorization, so the cache remembers
+/// the status of each, and a change in either resets the store.
 struct StoreCache {
     store: Retained<EKEventStore>,
-    /// Status observed the last time this store was used. `None` until the
-    /// first check. Drives the `reset()` decision below.
-    last_status: Option<AuthorizationStatus>,
+    /// Reminders' status the last time this store was used for them. `None`
+    /// until the first check. Drives the `reset()` decision below.
+    last_reminder_status: Option<AuthorizationStatus>,
+    /// The same for events.
+    last_event_status: Option<AuthorizationStatus>,
+}
+
+/// Which kind of data a call uses the store for. Each has its own
+/// authorization status.
+#[derive(Debug, Clone, Copy)]
+enum StoreUse {
+    Reminders,
+    Events,
 }
 
 impl StoreCache {
@@ -452,7 +467,8 @@ impl StoreCache {
     fn build() -> Self {
         Self {
             store: unsafe { EKEventStore::new() },
-            last_status: None,
+            last_reminder_status: None,
+            last_event_status: None,
         }
     }
 
@@ -487,11 +503,59 @@ impl StoreCache {
     /// If either changes — an `ensure_*` moved below a fetch, or a live
     /// `Retained<EKObject>` became part of the public API — this reset would
     /// start invalidating objects out from under callers.
-    fn reconcile(&mut self, current: AuthorizationStatus) {
-        if needs_store_reset(self.last_status, current) {
+    fn reconcile(&mut self, used_for: StoreUse, current: AuthorizationStatus) {
+        let last = match used_for {
+            StoreUse::Reminders => &mut self.last_reminder_status,
+            StoreUse::Events => &mut self.last_event_status,
+        };
+        if needs_store_reset(*last, current) {
             unsafe { self.store.reset() };
         }
-        self.last_status = Some(current);
+        *last = Some(current);
+    }
+}
+
+/// EventKit refused this process a store: `EKCADErrorDomain` 1021, *"This
+/// process has too many EKEventStore instances. Use fewer event stores."*
+fn is_store_refused(domain: &str, code: isize) -> bool {
+    domain == "EKCADErrorDomain" && code == 1021
+}
+
+/// Drop this thread's store, so the next manager builds a new one.
+///
+/// For a store EventKit has refused. Kept in the cache, it would fail every
+/// call on its thread for as long as the thread lives, and the EventKit
+/// thread lives as long as the process: the server would be stuck until a
+/// restart. Managers already holding it keep it until they are dropped.
+fn forget_store() {
+    STORE.with(|cell| drop(cell.borrow_mut().take()));
+}
+
+/// An access request's error, as its completion block reported it.
+struct AccessRequestError {
+    text: String,
+    store_refused: bool,
+}
+
+impl AccessRequestError {
+    fn of(error: &NSError) -> Self {
+        Self {
+            text: format!("{error:?}"),
+            store_refused: is_store_refused(&error.domain().to_string(), error.code()),
+        }
+    }
+
+    /// The message a caller gets. A refused store is forgotten
+    /// ([`forget_store`]) before this is returned, so the message says so.
+    fn message(&self) -> String {
+        if self.store_refused {
+            format!(
+                "{} (EventKit refused this store; the next call builds a new one)",
+                self.text
+            )
+        } else {
+            self.text.clone()
+        }
     }
 }
 
@@ -515,13 +579,8 @@ fn needs_store_reset(previous: Option<AuthorizationStatus>, current: Authorizati
 }
 
 thread_local! {
-    /// Per-thread reminders store. See [`StoreCache`].
-    static REMINDER_STORE: std::cell::RefCell<Option<StoreCache>> =
-        const { std::cell::RefCell::new(None) };
-    /// Per-thread events store. Separate from the reminders one because the
-    /// two managers have always held distinct stores; unifying them is a
-    /// larger change than the caching fix warrants.
-    static EVENT_STORE: std::cell::RefCell<Option<StoreCache>> =
+    /// This thread's store, for reminders and events alike. See [`StoreCache`].
+    static STORE: std::cell::RefCell<Option<StoreCache>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -538,7 +597,7 @@ impl RemindersManager {
     /// freely — that was the pre-existing pattern at ~68 call sites and it no
     /// longer pays EventKit initialization each time.
     pub fn new() -> Self {
-        let store = REMINDER_STORE.with(|cell| {
+        let store = STORE.with(|cell| {
             cell.borrow_mut()
                 .get_or_insert_with(StoreCache::build)
                 .store
@@ -567,20 +626,22 @@ impl RemindersManager {
     ///
     /// Returns Ok(true) if access was granted, Ok(false) if denied
     pub fn request_access(&self) -> Result<bool> {
-        let result = Arc::new((Mutex::new(None::<(bool, Option<String>)>), Condvar::new()));
+        let result = Arc::new((
+            Mutex::new(None::<(bool, Option<AccessRequestError>)>),
+            Condvar::new(),
+        ));
         let result_clone = Arc::clone(&result);
 
         let completion = RcBlock::new(move |granted: Bool, error: *mut NSError| {
-            let error_msg = if !error.is_null() {
-                let error_ref = unsafe { &*error };
-                Some(format!("{:?}", error_ref))
+            let error = if !error.is_null() {
+                Some(AccessRequestError::of(unsafe { &*error }))
             } else {
                 None
             };
 
             let (lock, cvar) = &*result_clone;
             let mut res = lock.lock();
-            *res = Some((granted.as_bool(), error_msg));
+            *res = Some((granted.as_bool(), error));
             cvar.notify_one();
         });
 
@@ -601,7 +662,12 @@ impl RemindersManager {
 
         match res.take() {
             Some((granted, None)) => Ok(granted),
-            Some((_, Some(error))) => Err(RemindersError::AuthorizationRequestFailed(error)),
+            Some((_, Some(error))) => {
+                if error.store_refused {
+                    forget_store();
+                }
+                Err(RemindersError::AuthorizationRequestFailed(error.message()))
+            }
             None => Err(RemindersError::AuthorizationRequestFailed(
                 "Unknown error".to_string(),
             )),
@@ -642,9 +708,9 @@ impl RemindersManager {
 
     /// Reset this thread's cached store if the grant changed since last use.
     fn reconcile_store(status: AuthorizationStatus) {
-        REMINDER_STORE.with(|cell| {
+        STORE.with(|cell| {
             if let Some(cache) = cell.borrow_mut().as_mut() {
-                cache.reconcile(status);
+                cache.reconcile(StoreUse::Reminders, status);
             }
         });
     }
@@ -2568,7 +2634,7 @@ impl EventsManager {
     ///
     /// Cheap — see [`RemindersManager::new`] and the private `StoreCache`.
     pub fn new() -> Self {
-        let store = EVENT_STORE.with(|cell| {
+        let store = STORE.with(|cell| {
             cell.borrow_mut()
                 .get_or_insert_with(StoreCache::build)
                 .store
@@ -2587,20 +2653,22 @@ impl EventsManager {
     ///
     /// Returns Ok(true) if access was granted, Ok(false) if denied
     pub fn request_access(&self) -> Result<bool> {
-        let result = Arc::new((Mutex::new(None::<(bool, Option<String>)>), Condvar::new()));
+        let result = Arc::new((
+            Mutex::new(None::<(bool, Option<AccessRequestError>)>),
+            Condvar::new(),
+        ));
         let result_clone = Arc::clone(&result);
 
         let completion = RcBlock::new(move |granted: Bool, error: *mut NSError| {
-            let error_msg = if !error.is_null() {
-                let error_ref = unsafe { &*error };
-                Some(format!("{:?}", error_ref))
+            let error = if !error.is_null() {
+                Some(AccessRequestError::of(unsafe { &*error }))
             } else {
                 None
             };
 
             let (lock, cvar) = &*result_clone;
             let mut res = lock.lock();
-            *res = Some((granted.as_bool(), error_msg));
+            *res = Some((granted.as_bool(), error));
             cvar.notify_one();
         });
 
@@ -2620,7 +2688,12 @@ impl EventsManager {
 
         match res.take() {
             Some((granted, None)) => Ok(granted),
-            Some((_, Some(error))) => Err(EventKitError::AuthorizationRequestFailed(error)),
+            Some((_, Some(error))) => {
+                if error.store_refused {
+                    forget_store();
+                }
+                Err(EventKitError::AuthorizationRequestFailed(error.message()))
+            }
             None => Err(EventKitError::AuthorizationRequestFailed(
                 "Unknown error".to_string(),
             )),
@@ -2651,9 +2724,9 @@ impl EventsManager {
     /// Reset this thread's cached store if the grant changed since last use.
     /// See `RemindersManager::reconcile_store` and [`StoreCache::reconcile`].
     fn reconcile_store(status: AuthorizationStatus) {
-        EVENT_STORE.with(|cell| {
+        STORE.with(|cell| {
             if let Some(cache) = cell.borrow_mut().as_mut() {
-                cache.reconcile(status);
+                cache.reconcile(StoreUse::Events, status);
             }
         });
     }
@@ -3983,6 +4056,18 @@ mod tests {
             AuthRefusal::Restricted.into_error(),
             EventKitError::AuthorizationRestricted
         ));
+    }
+
+    /// Only EventKit's "too many stores" refusal makes the cache drop its
+    /// store. A denial or any other failure leaves it in place: the store is
+    /// fine, and rebuilding it would cost the very initialisation the cache
+    /// exists to save.
+    #[test]
+    fn only_the_too_many_stores_refusal_drops_the_store() {
+        assert!(is_store_refused("EKCADErrorDomain", 1021));
+        assert!(!is_store_refused("EKCADErrorDomain", 1013));
+        assert!(!is_store_refused("EKErrorDomain", 1021));
+        assert!(!is_store_refused("NSCocoaErrorDomain", 1021));
     }
 
     // ── Store cache / reset-on-transition ────────────────────────────────

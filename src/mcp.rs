@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 mod tasks;
 use tasks::{ManagedTask, TaskCompletion, TaskFailureGuard, TaskManager};
 
+#[path = "mcp_thread.rs"]
+mod eventkit_thread;
+
 use crate::{AuthorizationStatus, EventsManager, RemindersManager};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone};
 
@@ -1226,32 +1229,29 @@ pub struct CreateReminderPromptArgs {
 ///
 /// EventKit objects (`Retained<EKEventStore>` and its managers) are `!Send + !Sync`,
 /// but every handler in this module keeps those values stack-local and never holds
-/// one across an `.await`. That makes the generated handler futures `Send`, so the
-/// server can run on a normal multi-thread tokio runtime without rmcp's `local`
-/// feature. New handlers MUST preserve this invariant.
+/// one across an `.await`. That makes the generated handler futures `Send`, which
+/// `call_tool` and `get_prompt` need: they move each call onto the EventKit thread
+/// (`mcp_thread.rs`). New handlers MUST preserve this invariant.
 ///
-/// **Never reach for `tokio::task::spawn_blocking` to satisfy it.** Doing so
-/// looks right — the `!Send` value would live entirely inside the closure — but
-/// it is the one thing that breaks the store cache. Stores are cached PER
-/// THREAD (see `StoreCache` in `imp.rs`), so the process holds two
-/// `EKEventStore`s for every thread that has ever touched EventKit. The worker
-/// pool is fixed at roughly the core count, which keeps that total small; the
-/// blocking pool is not — tokio grows it to **512 threads** by default, which
-/// would mean up to 1024 stores. EventKit refuses long before that:
+/// That thread is what keeps the process to one `EKEventStore`. Stores are
+/// cached PER THREAD (see `StoreCache` in `imp.rs`), so every thread that
+/// touches EventKit builds its own, and EventKit refuses a process that holds
+/// too many:
 ///
 /// ```text
 /// EKCADErrorDomain 1021: "This process has too many EKEventStore instances.
 ///                         Use fewer event stores."
 /// ```
 ///
-/// That error is exactly the outage the per-thread cache was introduced to fix
-/// (a fresh store per tool call), and routing EventKit work onto the blocking
-/// pool would reintroduce it at a worse scale.
-///
-/// So: keep EventKit calls synchronous and on the handler's own thread. If a
-/// handler is slow enough to need backgrounding, use the MCP task surface
-/// (`execution(task_support = "optional")` + `enqueue_task`), which moves the
-/// work to another *worker* thread rather than an unbounded blocking one.
+/// A fresh store per tool call caused that first, and 0.6.0 cached them. A
+/// store per tokio worker caused it again, two per worker, until every call
+/// moved to one thread. So keep EventKit calls synchronous and inside the
+/// handler, and **never** move them to another thread: not
+/// `tokio::task::spawn_blocking` (a pool of up to 512 threads), not
+/// `std::thread::spawn`, not a runtime of their own. A handler slow enough to
+/// need backgrounding uses the MCP task surface
+/// (`execution(task_support = "optional")` + `enqueue_task`), whose worker calls
+/// `call_tool` and so lands on the EventKit thread too.
 #[derive(Clone)]
 pub struct EventKitServer {
     /// Background tasks this server owns (SEP-1686).
@@ -2955,10 +2955,62 @@ impl EventKitServer {
     }
 }
 
+/// What a caller gets when its work panicked on the EventKit thread. An abort
+/// also lands here, but only once the caller is gone, so nobody reads it.
+fn failed_on_eventkit_thread(what: &str, error: &tokio::task::JoinError) -> McpError {
+    McpError::internal_error(
+        format!("the {what} failed on the EventKit thread: {error}"),
+        None,
+    )
+}
+
 // Implement the server handler
 #[tool_handler]
 #[prompt_handler]
 impl rmcp::ServerHandler for EventKitServer {
+    // ── The EventKit thread ─────────────────────────────────────────────
+    //
+    // Every tool call and prompt runs on the one EventKit thread
+    // (`mcp_thread.rs`), so the process holds one EKEventStore. These two
+    // replace what `#[tool_handler]` and `#[prompt_handler]` would generate,
+    // which run the routers on whichever worker rmcp's request task landed on.
+    // The macros generate neither when the impl already has it. A
+    // task-augmented call comes through here too: `enqueue_task`'s worker
+    // calls `call_tool`.
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let server = self.clone();
+        eventkit_thread::run(async move {
+            let call = rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
+            Self::tool_router().call(call).await
+        })
+        .await
+        .unwrap_or_else(|e| Err(failed_on_eventkit_thread("tool call", &e)))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let server = self.clone();
+        eventkit_thread::run(async move {
+            let prompt = rmcp::handler::server::prompt::PromptContext::new(
+                &server,
+                request.name,
+                request.arguments,
+                context,
+            );
+            Self::prompt_router().get_prompt(prompt).await
+        })
+        .await
+        .unwrap_or_else(|e| Err(failed_on_eventkit_thread("prompt", &e)))
+    }
+
     // ── MCP tasks (SEP-1686) ────────────────────────────────────────────
     //
     // Some EventKit work is slow enough that a host may time the call out: a

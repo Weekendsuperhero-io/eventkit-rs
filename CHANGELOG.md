@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T04:27
-updated: 2026-10-10T00:00
+updated: 2026-10-16T00:00
 ---
 # Changelog
 
@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Fixed
+- **EventKit store exhaustion, again** — 0.6.0 cached the store per thread, and the MCP server ran its tools on every tokio worker, with two stores each (reminders and events): twenty on a ten-core Mac, each a connection to the calendar daemon, and every authorization change reset them all. Agent Muse's beta was refused twice (2026-10-14 and 2026-10-15) with `EKCADErrorDomain 1021 — "This process has too many EKEventStore instances. Use fewer event stores."`
+  - Every tool call and prompt now runs on one dedicated thread (`mcp_thread.rs`, named `eventkit`), so the server holds one store however many connections or workers its host has. rmcp's service loop stays on the host's runtime, so a call that waits on the consent dialog no longer gets a host's liveness pings timed out.
+  - Reminders and events share that one store, as Apple's single instance does. The cache remembers each kind's authorization status, and a change in either resets the store.
+  - A store EventKit refuses is dropped, and the next call builds a new one. It used to stay cached and fail every call on its thread until a restart.
 
 ### Changed
 - **Rust 1.99 or newer** (`rust-version`), the toolchain Agent Muse builds with.
