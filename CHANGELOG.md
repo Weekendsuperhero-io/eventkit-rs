@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Rust 1.99 or newer** (`rust-version`), the toolchain Agent Muse builds with.
-- **`rmcp` 2.2.0 → 3.5.1**, exact-pinned to the embedding Agent Muse
+- **`rmcp` 2.2.0 → 3.6.0**, exact-pinned to the embedding Agent Muse
   workspace's copy, so the app links one rmcp.
 - **MCP 2026-07-28 alongside 2025-11-25** — a 2026-07-28 client runs that
   revision's stateless lifecycle: `server/discover` answers with every
