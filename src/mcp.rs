@@ -6,11 +6,11 @@
 //! This module is gated behind the `mcp` feature flag.
 
 // `RoleServer` / `service::RequestContext` are NOT imported: since rmcp-macros
-// 2.x (#866) the `#[prompt_handler]` / `#[tool_handler]` expansions name those
-// types with fully qualified paths, so they no longer have to be in scope.
+// 2.x (#866) the `#[tool_handler]` expansion names those types with fully
+// qualified paths, and the hand-written handlers below do the same.
 use rmcp::{
     ErrorData as McpError, ServiceExt, handler::server::wrapper::Parameters, model::*, prompt,
-    prompt_handler, prompt_router, schemars, schemars::JsonSchema, tool, tool_handler, tool_router,
+    prompt_router, schemars, schemars::JsonSchema, tool, tool_handler, tool_router,
     transport::stdio,
 };
 use serde::{Deserialize, Serialize};
@@ -2965,18 +2965,22 @@ fn failed_on_eventkit_thread(what: &str, error: &tokio::task::JoinError) -> McpE
 }
 
 // Implement the server handler
+//
+// `#[tool_handler]` but NOT `#[prompt_handler]`: the prompt macro REPLACES a
+// hand-written `get_prompt` with its own (rmcp-macros 2.x and 3.x alike), which
+// runs the router on rmcp's request worker and would put a store on every
+// worker again. `#[tool_handler]` keeps a hand-written `call_tool`. So
+// `get_prompt` and `list_prompts` are written out below, and
+// `get_prompt_is_ours_not_the_macros` holds the line.
 #[tool_handler]
-#[prompt_handler]
 impl rmcp::ServerHandler for EventKitServer {
     // ── The EventKit thread ─────────────────────────────────────────────
     //
     // Every tool call and prompt runs on the one EventKit thread
     // (`mcp_thread.rs`), so the process holds one EKEventStore. These two
-    // replace what `#[tool_handler]` and `#[prompt_handler]` would generate,
-    // which run the routers on whichever worker rmcp's request task landed on.
-    // The macros generate neither when the impl already has it. A
-    // task-augmented call comes through here too: `enqueue_task`'s worker
-    // calls `call_tool`.
+    // replace what the macros would generate, which run the routers on
+    // whichever worker rmcp's request task landed on. A task-augmented call
+    // comes through here too: `enqueue_task`'s worker calls `call_tool`.
 
     async fn call_tool(
         &self,
@@ -3009,6 +3013,20 @@ impl rmcp::ServerHandler for EventKitServer {
         })
         .await
         .unwrap_or_else(|e| Err(failed_on_eventkit_thread("prompt", &e)))
+    }
+
+    /// What `#[prompt_handler]` generates; listing touches no EventKit value,
+    /// so it stays on rmcp's worker.
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult {
+            prompts: Self::prompt_router().list_all(),
+            meta: None,
+            next_cursor: None,
+        })
     }
 
     // ── MCP tasks (SEP-1686) ────────────────────────────────────────────
@@ -3315,6 +3333,45 @@ pub fn dump_sources() -> Result<String, crate::EventKitError> {
 mod tests {
     use super::*;
     use crate::EventKitError;
+
+    /// `#[prompt_handler]` replaces a hand-written `get_prompt` with one that
+    /// runs the router on rmcp's worker, so an impl carrying it would make
+    /// every prompt (each builds a `RemindersManager`) open a store on
+    /// whichever worker served it — the `EKCADErrorDomain 1021` outage again,
+    /// with nothing failing to compile. The attribute must stay off the
+    /// handler, and `get_prompt` must keep routing onto the EventKit thread.
+    #[test]
+    fn get_prompt_is_ours_not_the_macros() {
+        let source = include_str!("mcp.rs");
+        let handler = source
+            .find("impl rmcp::ServerHandler for EventKitServer")
+            .expect("the handler impl");
+        let preamble = &source[source[..handler].rfind("\n}\n").unwrap_or(0)..handler];
+        let attributes: Vec<&str> = preamble
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("#["))
+            .collect();
+        assert!(
+            attributes.contains(&"#[tool_handler]"),
+            "the guard looks at the handler's own attributes: {attributes:?}"
+        );
+        assert!(
+            !attributes.iter().any(|a| a.contains("prompt_handler")),
+            "#[prompt_handler] would replace the hand-written get_prompt: {attributes:?}"
+        );
+        let body = &source[handler..];
+        let get_prompt = body
+            .find("async fn get_prompt(")
+            .expect("a hand-written get_prompt");
+        let next_fn = body[get_prompt + 1..]
+            .find("async fn ")
+            .map_or(body.len(), |i| get_prompt + 1 + i);
+        assert!(
+            body[get_prompt..next_fn].contains("eventkit_thread::run"),
+            "get_prompt must run the prompt router on the EventKit thread"
+        );
+    }
 
     #[test]
     fn parse_availability_accepts_every_variant() {

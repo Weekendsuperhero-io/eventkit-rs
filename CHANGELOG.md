@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Every tool call and prompt now runs on one dedicated thread (`mcp_thread.rs`, named `eventkit`), so the server holds one store however many connections or workers its host has. rmcp's service loop stays on the host's runtime, so a call that waits on the consent dialog no longer gets a host's liveness pings timed out.
   - Reminders and events share that one store, as Apple's single instance does. The cache remembers each kind's authorization status, and a change in either resets the store.
   - A store EventKit refuses is dropped, and the next call builds a new one. It used to stay cached and fail every call on its thread until a restart.
+  - Prompts too. `#[prompt_handler]` replaces a hand-written `get_prompt` with its own (rmcp-macros 2.x and 3.x alike), so the first cut's thread-routed `get_prompt` never ran: every prompt, each of which builds a `RemindersManager`, still opened a store on whichever worker served it. The handler now writes `get_prompt` and `list_prompts` itself, and `get_prompt_is_ours_not_the_macros` keeps the attribute off.
 
 ### Changed
 - **Rust 1.99 or newer** (`rust-version`), the toolchain Agent Muse builds with.
