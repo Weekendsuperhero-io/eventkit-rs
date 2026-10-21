@@ -29,7 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from a client that did not declare the extension, are answered inline as
   before. Up to 4 tasks run at once (each takes its turn on the one EventKit
   thread, where every EventKit call runs) and 256 are held; a task lives
-  1 hour. A tool that panics fails its task instead of stranding it.
+  1 hour. A tool that panics fails its task instead of stranding it. Closing
+  the connection asks every task to stop; one still running after 2 seconds is
+  left to finish the item it is on and stop, never aborted mid-item. A task
+  past its hour is aborted, with its batch told to stop first.
 - **Batches stop between items when cancelled** — `batch_delete`,
   `batch_move` and `batch_update` check for cancellation (`tasks/cancel`,
   `notifications/cancelled`, or the connection closing) before each item. A

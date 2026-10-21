@@ -101,7 +101,13 @@ whose join error settles it. The 0.6.x task manager had the opposite bug,
 where a panicking tool held its slot until the process exited.
 
 Tasks live with the connection. Closing it cancels every operation token,
-waits 2 seconds, then aborts what is left.
+waits 2 seconds, then drops the tasks. An operation still running then is
+detached, not aborted: its token is cancelled, so it finishes the item it is
+on and stops, like any cancelled batch. rmcp's TTL does abort, but cancels the
+token first, because an abort cannot reach a synchronous batch on the EventKit
+thread, which would otherwise run on after its task was reported failed
+(review of the 0.8.0 work, 2026-10-21; `shutdown_lets_an_operation_reach_its_next_check`,
+`the_ttl_cancels_the_operations_token`).
 
 The three batch tools share one loop (`run_batch`), so cancellation and
 progress live in one place. Item errors are built directly, instead of by

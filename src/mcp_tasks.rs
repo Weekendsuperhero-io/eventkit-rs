@@ -28,7 +28,10 @@
 //! token; a batch stops between items ([`stop_requested`]), and a single
 //! EventKit call runs to its end. A task whose tool saw the cancellation is
 //! `cancelled`; one that finished first is `completed`. rmcp's TTL is the only
-//! hard stop.
+//! hard stop, and even it cancels the token first, so a synchronous batch (which
+//! an abort cannot reach) stops between items. Closing the connection is not a
+//! hard stop: an operation still running when the shutdown grace ends is
+//! detached and stops at its next check (see [`Operation`]).
 //!
 //! **Progress.** After promotion a batch reports how far it got as the task's
 //! status message, and `tasks/get` carries the numbers under
@@ -90,7 +93,7 @@ pub(super) struct TaskConfig {
     /// request.
     pub(super) max_tracked: usize,
     /// How long running tasks get to stop when the connection closes, before
-    /// whatever is left is aborted.
+    /// whatever is left is detached (see [`Operation`]).
     pub(super) shutdown_grace: Duration,
 }
 
@@ -190,19 +193,37 @@ impl ProgressBoard {
     }
 }
 
-/// The spawned operation behind a call. Aborted if dropped before it ends, so
-/// nothing outlives the request or task that owns it.
-struct Operation(JoinHandle<Result<CallToolResponse, McpError>>);
+/// The spawned operation behind a call, with the token it runs on and the
+/// connection's lifetime.
+///
+/// Dropped before it ends, it is stopped, and how depends on why:
+///
+/// - The connection is shutting down (its lifetime is cancelled, so this
+///   operation's token already is): DETACHED. It runs on to its next check
+///   and ends there, the way any cancelled call ends; an abort at an
+///   arbitrary await could stop a batch between an item's change and its
+///   commit.
+/// - Anything else (rmcp's TTL, the one hard stop): its token is cancelled
+///   first, so a synchronous batch on the EventKit thread, which no abort can
+///   reach, stops between items; then it is aborted.
+struct Operation {
+    handle: JoinHandle<Result<CallToolResponse, McpError>>,
+    token: CancellationToken,
+    lifetime: CancellationToken,
+}
 
 impl Operation {
     async fn join(&mut self) -> Result<Result<CallToolResponse, McpError>, JoinError> {
-        (&mut self.0).await
+        (&mut self.handle).await
     }
 }
 
 impl Drop for Operation {
     fn drop(&mut self) {
-        self.0.abort();
+        self.token.cancel();
+        if !self.lifetime.is_cancelled() {
+            self.handle.abort();
+        }
     }
 }
 
@@ -259,9 +280,11 @@ impl TaskRuntime {
         F: Future<Output = Result<CallToolResponse, McpError>> + Send + 'static,
     {
         let run = Arc::new(ToolRun::default());
-        let mut operation = Operation(super::eventkit_thread::spawn(
-            TOOL_RUN.scope(Arc::clone(&run), operation),
-        ));
+        let mut operation = Operation {
+            handle: super::eventkit_thread::spawn(TOOL_RUN.scope(Arc::clone(&run), operation)),
+            token: operation_ct.clone(),
+            lifetime: self.lifetime.clone(),
+        };
         let promote_at = tokio::time::sleep(self.config.promote_after);
         tokio::pin!(promote_at);
         let mut promotable = true;
@@ -379,7 +402,9 @@ impl TaskRuntime {
 
     /// The connection is gone, and its tasks with it: nothing can poll them
     /// any more. Ask every operation to stop, give them
-    /// [`TaskConfig::shutdown_grace`] to do so, then abort what is left.
+    /// [`TaskConfig::shutdown_grace`] to do so, then drop the tasks. An
+    /// operation still running is detached rather than aborted (see
+    /// [`Operation`]): it stops at its next check.
     pub(super) async fn shutdown(&self) {
         self.lifetime.cancel();
         let deadline = tokio::time::Instant::now() + self.config.shutdown_grace;
@@ -738,5 +763,72 @@ mod tests {
         runtime.shutdown().await;
         assert_eq!(runtime.manager.running_task_count(), 0);
         assert!(runtime.get(&task_id).is_err());
+    }
+
+    /// An operation still between two checks when the grace runs out is not
+    /// cut there: it is detached, finishes the item it is on, and stops.
+    #[tokio::test]
+    async fn shutdown_lets_an_operation_reach_its_next_check() {
+        let runtime = TaskRuntime::new(TaskConfig {
+            shutdown_grace: Duration::from_millis(100),
+            ..quick()
+        });
+        let item_done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&item_done);
+        let response = runtime
+            .run_call(
+                "batch_move",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async move {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    flag.store(true, Ordering::SeqCst);
+                    done("stopped after the item")
+                },
+            )
+            .await;
+        task_id(response);
+        runtime.shutdown().await;
+        assert!(!item_done.load(Ordering::SeqCst), "the grace ended first");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            item_done.load(Ordering::SeqCst),
+            "the item was finished, not cut"
+        );
+    }
+
+    /// rmcp's TTL aborts a task that runs past it, and cancels the
+    /// operation's token first: a synchronous batch, which the abort cannot
+    /// reach, then stops between items.
+    #[tokio::test]
+    async fn the_ttl_cancels_the_operations_token() {
+        let runtime = TaskRuntime::new(TaskConfig {
+            ttl: Duration::from_millis(150),
+            ..quick()
+        });
+        let operation_ct = runtime.operation_token();
+        let token = operation_ct.clone();
+        let response = runtime
+            .run_call(
+                "batch_delete",
+                CancellationToken::new(),
+                operation_ct,
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    done("too late")
+                },
+            )
+            .await;
+        let task_id = task_id(response);
+        // Polling is what runs rmcp's TTL sweep; the aborted driver, and the
+        // operation with it, is dropped on the runtime's next turn after that.
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = runtime.get(&task_id);
+            if token.is_cancelled() {
+                break;
+            }
+        }
+        assert!(token.is_cancelled(), "the TTL cancelled the token");
     }
 }
