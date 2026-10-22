@@ -94,9 +94,13 @@ objc2-foundation = { version = "0.3", features = [
   "NSCalendar",
   "NSDate",
   "NSError",
+  # The store-change observer (`mcp_changes.rs`).
+  "NSNotification",
+  "NSOperation",
   "NSPredicate",
   "NSRunLoop",
   "NSString",
+  "block2",
   "NSTimeZone",
   "NSURL",
   "NSValue"

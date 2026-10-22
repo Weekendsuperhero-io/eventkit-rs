@@ -570,9 +570,14 @@ fn mcp_names_itself_calendar() {
     assert_eq!(info["name"], "calendar", "{resp}");
     assert_eq!(info["title"], "Calendar & Reminders", "{resp}");
     assert_eq!(info["version"], env!("CARGO_PKG_VERSION"), "{resp}");
-    assert!(
-        resp["result"]["capabilities"]["resources"].is_object(),
-        "resources are advertised: {resp}"
+    let resources = &resp["result"]["capabilities"]["resources"];
+    assert_eq!(
+        resources["subscribe"], true,
+        "resources are subscribable: {resp}"
+    );
+    assert_eq!(
+        resources["listChanged"], true,
+        "list changes are announced: {resp}"
     );
 }
 
@@ -632,4 +637,66 @@ fn mcp_refuses_unknown_and_malformed_resource_uris() {
         json!({"uri": "calendar://events?from=tomorrow"}),
     );
     assert_eq!(resp["error"]["code"], -32602, "{resp}");
+}
+
+/// A 2025-11-25 client subscribes URI by URI: to a resource here, and not to
+/// one this server does not have. Subscribing never asks for access, so this
+/// runs the same with or without it.
+#[test]
+fn mcp_subscribes_to_resources_here_and_nowhere_else() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let resp = c.request(
+        "resources/subscribe",
+        json!({"uri": "calendar://calendars"}),
+    );
+    assert!(resp["result"].is_object(), "{resp}");
+    let resp = c.request("resources/subscribe", json!({"uri": "bridge://calendars"}));
+    assert_eq!(resp["error"]["code"], -32002, "{resp}");
+    let resp = c.request(
+        "resources/unsubscribe",
+        json!({"uri": "calendar://calendars"}),
+    );
+    assert!(resp["result"].is_object(), "{resp}");
+}
+
+/// A 2026-07-28 client listens instead: the acknowledgment carries what this
+/// server serves of the filter asked for, which is resource list changes and
+/// its own URIs. Its tools and prompts never change, and the email URI is
+/// another server's.
+#[test]
+fn mcp_acknowledges_a_listen_with_what_it_serves() {
+    let mut c = McpClient::spawn();
+    c.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "subscriptions/listen",
+        "params": {
+            "notifications": {
+                "toolsListChanged": true,
+                "resourcesListChanged": true,
+                "resourceSubscriptions": ["calendar://calendars", "email://work/INBOX"],
+            },
+            "_meta": stateless_meta("2026-07-28", &json!({})),
+        },
+    }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ack = loop {
+        let line = c
+            .next_line(deadline)
+            .expect("an acknowledgment before the deadline");
+        let message: Value = serde_json::from_str(line.trim()).expect("JSON");
+        assert!(message.get("error").is_none(), "refused: {message}");
+        if message["method"] == "notifications/subscriptions/acknowledged" {
+            break message;
+        }
+    };
+    assert_eq!(
+        ack["params"]["notifications"],
+        json!({
+            "resourcesListChanged": true,
+            "resourceSubscriptions": ["calendar://calendars"],
+        }),
+        "{ack}"
+    );
 }

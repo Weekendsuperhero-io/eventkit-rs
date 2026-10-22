@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RemindersManager::fetch_list_reminders(list_id, include_completed)`: one
   list's reminders by identifier (a title can name two lists), refusing an id
   that is not a reminder list's.
+- **Change notifications for those resources** (`src/mcp_changes.rs`): the
+  server declares `resources.subscribe` and `listChanged`. One observer per
+  process counts `EKEventStoreChangedNotification`; each subscription keeps a
+  fingerprint of what it watches and, once a burst has settled for half a
+  second, re-reads it on the EventKit thread and sends only what changed:
+  `notifications/resources/updated` per URI, `list_changed` for the list. A
+  2025-11-25 client subscribes with `resources/subscribe` and hears list
+  changes once initialized; a 2026-07-28 client holds `subscriptions/listen`
+  open, accepted for list changes and this server's URIs. A watch also wakes
+  at local midnight (a default window moves on) and when a call has moved
+  access, and never asks for access itself.
+- **`eventkit --mcp` turns the main run loop.** EventKit posts store changes on
+  the main thread's run loop whatever thread made the store, so with the main
+  thread blocked in `block_on` none were ever heard. The server now runs on a
+  thread of its own and exits the process when it ends.
 - **MCP tasks, as the SEP-2663 extension** (`io.modelcontextprotocol/tasks`,
   offered on both revisions), version 0.8.0 — a call to `list_reminders`,
   `list_events`, `search`, `batch_delete`, `batch_move`, `batch_update`,

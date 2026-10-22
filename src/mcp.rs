@@ -15,6 +15,8 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "mcp_changes.rs"]
+mod changes;
 #[path = "mcp_thread.rs"]
 mod eventkit_thread;
 #[path = "mcp_resources.rs"]
@@ -1276,6 +1278,9 @@ pub struct CreateReminderPromptArgs {
 pub struct EventKitServer {
     /// This connection's tasks (SEP-2663).
     tasks: std::sync::Arc<tasks::TaskRuntime>,
+    /// This connection's resource subscriptions, when it speaks 2025-11-25
+    /// (`mcp_changes.rs`); a 2026-07-28 client's live in its listen.
+    changes: std::sync::Arc<changes::Connection>,
 }
 
 impl Default for EventKitServer {
@@ -1318,6 +1323,7 @@ impl EventKitServer {
     fn with_tasks(config: tasks::TaskConfig) -> Self {
         Self {
             tasks: std::sync::Arc::new(tasks::TaskRuntime::new(config)),
+            changes: std::sync::Arc::default(),
         }
     }
 
@@ -2989,7 +2995,7 @@ impl rmcp::ServerHandler for EventKitServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<GetPromptResponse, McpError> {
         let server = self.clone();
-        eventkit_thread::run(async move {
+        let response = eventkit_thread::run(async move {
             let prompt = rmcp::handler::server::prompt::PromptContext::new(
                 &server,
                 request.name,
@@ -2999,7 +3005,9 @@ impl rmcp::ServerHandler for EventKitServer {
             Self::prompt_router().get_prompt(prompt).await
         })
         .await
-        .unwrap_or_else(|e| Err(failed_on_eventkit_thread("prompt", &e)))
+        .unwrap_or_else(|e| Err(failed_on_eventkit_thread("prompt", &e)));
+        changes::note_access();
+        response
     }
 
     /// What `#[prompt_handler]` generates; listing touches no EventKit value,
@@ -3069,15 +3077,67 @@ impl rmcp::ServerHandler for EventKitServer {
     ) -> Result<ReadResourceResponse, McpError> {
         let target = resources::Target::parse(&request.uri, resources::start_of_today())?;
         let uri = request.uri;
-        let mut result = eventkit_thread::run(async move { resources::read(&target, &uri) })
+        let read = eventkit_thread::run(async move { resources::read(&target, &uri) })
             .await
-            .unwrap_or_else(|e| Err(failed_on_eventkit_thread("resource read", &e)))?;
+            .unwrap_or_else(|e| Err(failed_on_eventkit_thread("resource read", &e)));
+        changes::note_access();
+        let mut result = read?;
         if supports_cache_hints(&context) {
             result = result
                 .with_ttl_ms(resources::FRESH_MS)
                 .with_cache_scope(CacheScope::Private);
         }
         Ok(result.into())
+    }
+
+    // ── Change notifications (`mcp_changes.rs`) ─────────────────────────
+    //
+    // A 2025-11-25 client subscribes URI by URI and hears every list change
+    // through its peer; a 2026-07-28 client holds `subscriptions/listen` open.
+    // Either way only what changed is sent, and a watch never asks for access.
+
+    /// A 2025-11-25 client has initialized: from now on it hears each change
+    /// to the resource list, and to each resource it subscribes to.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
+        self.changes.start(context.peer);
+    }
+
+    // rmcp marks the pair legacy-only, which they are: a 2026-07-28 client
+    // subscribes through `subscriptions/listen`, a 2025-11-25 one through these.
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        resources::Target::parse(&request.uri, resources::start_of_today())?;
+        self.changes.subscribe(request.uri).await;
+        Ok(())
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        self.changes.unsubscribe(&request.uri);
+        Ok(())
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(changes::accepted(requested))
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        tokio::select! {
+            () = context.cancelled() => {}
+            () = changes::listen(context.sink().clone()) => {}
+        }
+        Ok(())
     }
 
     /// A call to one of the task tools from a client that declared the tasks
@@ -3095,13 +3155,15 @@ impl rmcp::ServerHandler for EventKitServer {
             .is_some_and(|capabilities| capabilities.supports_tasks());
         if !(tasks_declared && tasks::TASK_TOOLS.contains(&request.name.as_ref())) {
             let server = self.clone();
-            return eventkit_thread::run(async move {
+            let response = eventkit_thread::run(async move {
                 let call =
                     rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
                 Self::tool_router().call(call).await
             })
             .await
             .unwrap_or_else(|e| Err(failed_on_eventkit_thread("tool call", &e)));
+            changes::note_access();
+            return response;
         }
         let operation_ct = self.tasks.operation_token();
         let request_ct = std::mem::replace(&mut context.ct, operation_ct.clone());
@@ -3111,7 +3173,9 @@ impl rmcp::ServerHandler for EventKitServer {
             .run_call(&tool, request_ct, operation_ct, async move {
                 let call =
                     rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
-                Self::tool_router().call(call).await
+                let response = Self::tool_router().call(call).await;
+                changes::note_access();
+                response
             })
             .await
     }
@@ -3185,6 +3249,8 @@ impl rmcp::ServerHandler for EventKitServer {
             .enable_tools()
             .enable_prompts()
             .enable_resources()
+            .enable_resources_list_changed()
+            .enable_resources_subscribe()
             .enable_tasks()
             .build();
         ServerConfig::new(capabilities)
@@ -3207,7 +3273,8 @@ impl rmcp::ServerHandler for EventKitServer {
              `calendar://calendars` and `reminders://lists` list every calendar and list with \
              each one's URI, `calendar://events{?from,to}` reads the events in a window \
              (today and the next six days by default), and `reminders://reminders` the open \
-             reminders. Authorization is handled automatically on first use.",
+             reminders. Subscribe to one to be told when it changes. Authorization is handled \
+             automatically on first use.",
             )
     }
 }
@@ -3223,15 +3290,17 @@ where
     serve_server(transport, EventKitServer::new()).await
 }
 
-/// Serve one connection, then end its tasks: nothing can poll them once the
-/// client is gone.
+/// Serve one connection, then end its tasks and stop watching for it: nothing
+/// can poll the one or hear the other once the client is gone.
 async fn serve_server<T>(transport: T, server: EventKitServer) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let tasks = std::sync::Arc::clone(&server.tasks);
+    let changes = std::sync::Arc::clone(&server.changes);
     let service = server.serve(transport).await?;
     let result = service.waiting().await;
+    changes.shutdown();
     tasks.shutdown().await;
     result?;
     Ok(())
@@ -3249,8 +3318,10 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
 
     let server = EventKitServer::new();
     let tasks = std::sync::Arc::clone(&server.tasks);
+    let changes = std::sync::Arc::clone(&server.changes);
     let service = server.serve(stdio()).await?;
     let result = service.waiting().await;
+    changes.shutdown();
     tasks.shutdown().await;
     result?;
     Ok(())
@@ -3435,9 +3506,19 @@ mod tests {
             Some("Calendar & Reminders")
         );
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-        assert!(
-            info.capabilities.resources.is_some(),
-            "resources are advertised"
+        let resources = info
+            .capabilities
+            .resources
+            .expect("resources are advertised");
+        assert_eq!(
+            resources.subscribe,
+            Some(true),
+            "a resource can be subscribed to"
+        );
+        assert_eq!(
+            resources.list_changed,
+            Some(true),
+            "a change to the list is announced"
         );
     }
 
