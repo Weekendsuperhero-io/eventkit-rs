@@ -3291,7 +3291,6 @@ impl rmcp::ServerHandler for EventKitServer {
              decode HTML entities (e.g. &amp; -> &) and strip markup first, since this server \
              will not do that for you. Authorization is handled automatically on first use.",
             )
-
     }
 }
 
