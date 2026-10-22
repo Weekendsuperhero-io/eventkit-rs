@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 #[path = "mcp_thread.rs"]
 mod eventkit_thread;
+#[path = "mcp_resources.rs"]
+mod resources;
 #[path = "mcp_tasks.rs"]
 mod tasks;
 
@@ -33,6 +35,12 @@ use tokio_util::sync::CancellationToken;
 /// Named rather than taken from rmcp's `LATEST`, so a newer SDK does not move
 /// the protocol on its own.
 const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+
+/// What this server calls itself in its handshake: `name` is what a host may
+/// file it under, `title` what a person reads. EventKit, Apple's framework, is
+/// how it works rather than what it is.
+const SERVER_NAME: &str = "calendar";
+const SERVER_TITLE: &str = "Calendar & Reminders";
 
 // ============================================================================
 // Structured Output Types
@@ -2950,6 +2958,14 @@ fn failed_on_eventkit_thread(what: &str, error: &tokio::task::JoinError) -> McpE
     )
 }
 
+/// Whether this request's client speaks 2026-07-28, whose results each carry
+/// how long they stay fresh (`ttlMs`) and who may cache them (SEP-2549).
+fn supports_cache_hints(context: &rmcp::service::RequestContext<rmcp::RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
 // Implement the server handler
 //
 // `#[tool_handler]` but NOT `#[prompt_handler]`: the prompt macro REPLACES a
@@ -2993,17 +3009,75 @@ impl rmcp::ServerHandler for EventKitServer {
         _request: Option<PaginatedRequestParams>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
-        let supports_cache_hints = context
-            .protocol_version()
-            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        let hints = supports_cache_hints(&context);
         Ok(ListPromptsResult {
             result_type: Some(ResultType::COMPLETE),
             prompts: Self::prompt_router().list_all(),
             meta: None,
             next_cursor: None,
-            ttl_ms: supports_cache_hints.then_some(0),
-            cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+            ttl_ms: hints.then_some(0),
+            cache_scope: hints.then_some(CacheScope::Public),
         })
+    }
+
+    // ── Resources (`mcp_resources.rs`) ──────────────────────────────────
+    //
+    // Calendars and reminders as read-only resources. Listing a calendar and
+    // every read touch the store, so both run on the EventKit thread; the
+    // templates are compiled in and do not.
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let listed = eventkit_thread::run(async { resources::listed() })
+            .await
+            .map_err(|e| failed_on_eventkit_thread("resource list", &e))?;
+        let hints = supports_cache_hints(&context);
+        Ok(ListResourcesResult {
+            result_type: Some(ResultType::COMPLETE),
+            resources: listed,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: hints.then_some(resources::FRESH_MS),
+            // Calendar and list names are the person's own.
+            cache_scope: hints.then_some(CacheScope::Private),
+        })
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let hints = supports_cache_hints(&context);
+        Ok(ListResourceTemplatesResult {
+            result_type: Some(ResultType::COMPLETE),
+            resource_templates: resources::templates(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: hints.then_some(resources::TEMPLATES_FRESH_MS),
+            cache_scope: hints.then_some(CacheScope::Public),
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let target = resources::Target::parse(&request.uri, resources::start_of_today())?;
+        let uri = request.uri;
+        let mut result = eventkit_thread::run(async move { resources::read(&target, &uri) })
+            .await
+            .unwrap_or_else(|e| Err(failed_on_eventkit_thread("resource read", &e)))?;
+        if supports_cache_hints(&context) {
+            result = result
+                .with_ttl_ms(resources::FRESH_MS)
+                .with_cache_scope(CacheScope::Private);
+        }
+        Ok(result.into())
     }
 
     /// A call to one of the task tools from a client that declared the tasks
@@ -3110,6 +3184,7 @@ impl rmcp::ServerHandler for EventKitServer {
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
+            .enable_resources()
             .enable_tasks()
             .build();
         ServerConfig::new(capabilities)
@@ -3117,10 +3192,22 @@ impl rmcp::ServerHandler for EventKitServer {
             // handshake. rmcp answers a client asking for 2026-07-28 there
             // with this too.
             .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+            // Without this the server calls itself "rmcp": rmcp's
+            // `Implementation::from_build_env()` reads rmcp's own crate name
+            // and version, so every host saw `rmcp 3.6.0` (`rmcp 2.2.0`
+            // before it).
+            .with_server_info(
+                Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION"))
+                    .with_title(SERVER_TITLE),
+            )
             .with_instructions(
                 "This MCP server provides access to macOS Calendar events and Reminders. \
              Use the available tools to list, create, update, and delete calendar events \
-             and reminders. Authorization is handled automatically on first use.",
+             and reminders. The same calendars and reminders are also read-only resources: \
+             `calendar://calendars` and `reminders://lists` list every calendar and list with \
+             each one's URI, `calendar://events{?from,to}` reads the events in a window \
+             (today and the next six days by default), and `reminders://reminders` the open \
+             reminders. Authorization is handled automatically on first use.",
             )
     }
 }
@@ -3310,6 +3397,47 @@ mod tests {
         assert!(
             body[get_prompt..next_fn].contains("eventkit_thread::run"),
             "get_prompt must run the prompt router on the EventKit thread"
+        );
+    }
+
+    /// Listing calendars and reading a resource both build a manager, so both
+    /// run on the EventKit thread like every tool and prompt: on rmcp's worker
+    /// they would open a store per worker, the `EKCADErrorDomain 1021` outage
+    /// again, with nothing failing to compile.
+    #[test]
+    fn resources_touch_the_store_only_on_the_eventkit_thread() {
+        let source = include_str!("mcp.rs");
+        let handler = source
+            .find("impl rmcp::ServerHandler for EventKitServer")
+            .expect("the handler impl");
+        let body = &source[handler..];
+        for name in ["list_resources", "read_resource"] {
+            let start = body
+                .find(&format!("async fn {name}("))
+                .unwrap_or_else(|| panic!("a hand-written {name}"));
+            let end = body[start + 1..]
+                .find("async fn ")
+                .map_or(body.len(), |i| start + 1 + i);
+            assert!(
+                body[start..end].contains("eventkit_thread::run"),
+                "{name} must touch the store on the EventKit thread"
+            );
+        }
+    }
+
+    #[test]
+    fn the_server_calls_itself_calendar_and_offers_resources() {
+        use rmcp::ServerHandler as _;
+        let info = EventKitServer::new().get_info();
+        assert_eq!(info.server_info.name, "calendar");
+        assert_eq!(
+            info.server_info.title.as_deref(),
+            Some("Calendar & Reminders")
+        );
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            info.capabilities.resources.is_some(),
+            "resources are advertised"
         );
     }
 

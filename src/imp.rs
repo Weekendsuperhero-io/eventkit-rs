@@ -895,6 +895,39 @@ impl RemindersManager {
         self.fetch_by_predicate(&predicate)
     }
 
+    /// Reminders in ONE list, found by its identifier: a title can name two
+    /// lists (an iCloud "Reminders" beside an Exchange one), an identifier
+    /// names exactly one. Open reminders only, unless `include_completed`.
+    /// An identifier that is not a reminder list's (an event calendar's, or
+    /// nothing's) is `CalendarNotFound`: a reminder predicate over the wrong
+    /// kind of calendar is not something to hand EventKit.
+    pub fn fetch_list_reminders(
+        &self,
+        list_id: &str,
+        include_completed: bool,
+    ) -> Result<Vec<ReminderItem>> {
+        self.ensure_full_access()?;
+        let list = self.find_calendar_by_id(list_id)?;
+        // Bit 2 of `allowedEntityTypes` is reminders (see `calendar_to_info`).
+        if unsafe { list.allowedEntityTypes() }.0 & 2 == 0 {
+            return Err(RemindersError::CalendarNotFound(list_id.to_string()));
+        }
+        let lists = NSArray::from_retained_slice(&[list]);
+        let predicate = unsafe {
+            if include_completed {
+                self.store.predicateForRemindersInCalendars(Some(&*lists))
+            } else {
+                self.store
+                    .predicateForIncompleteRemindersWithDueDateStarting_ending_calendars(
+                        None,
+                        None,
+                        Some(&*lists),
+                    )
+            }
+        };
+        self.fetch_by_predicate(&predicate)
+    }
+
     /// Resolves `calendar_titles` (`Some(&["A", "B"])` etc.) to an NSArray
     /// of `EKCalendar` references restricted to reminder calendars. `None`
     /// → `Ok(None)` meaning "all calendars". Unknown title → error.

@@ -14,12 +14,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The server names itself** — `serverInfo` was rmcp's own (`rmcp 3.6.0`,
+  `rmcp 2.2.0` before), since `get_info` never set it and
+  `Implementation::from_build_env()` reads rmcp's crate. It is now `calendar`,
+  titled "Calendar & Reminders", at this crate's version.
 - **EventKit store exhaustion, again** — 0.6.0 cached the store per thread, and the MCP server ran its tools on every tokio worker, with two stores each (reminders and events): twenty on a ten-core Mac, each a connection to the calendar daemon, and every authorization change reset them all. Agent Muse's beta was refused twice (2026-10-14 and 2026-10-15) with `EKCADErrorDomain 1021 — "This process has too many EKEventStore instances. Use fewer event stores."`
   - Every tool call and prompt now runs on one dedicated thread (`mcp_thread.rs`, named `eventkit`), so the server holds one store however many connections or workers its host has. rmcp's service loop stays on the host's runtime, so a call that waits on the consent dialog no longer gets a host's liveness pings timed out.
   - Reminders and events share that one store, as Apple's single instance does. The cache remembers each kind's authorization status, and a change in either resets the store.
   - A store EventKit refuses is dropped, and the next call builds a new one. It used to stay cached and fail every call on its thread until a restart.
   - Prompts too. `#[prompt_handler]` replaces a hand-written `get_prompt` with its own (rmcp-macros 2.x and 3.x alike), so the first cut's thread-routed `get_prompt` never ran: every prompt, each of which builds a `RemindersManager`, still opened a store on whichever worker served it. The handler now writes `get_prompt` and `list_prompts` itself, and `get_prompt_is_ours_not_the_macros` keeps the attribute off.
 ### Added
+- **Calendars and reminders as resources** (`src/mcp_resources.rs`), read-only
+  JSON with the tools' own fields plus each listed item's `uri`:
+  `calendar://calendars`, `calendar://events{?from,to}`,
+  `calendar://calendars/{calendarId}/events{?from,to}`,
+  `calendar://events/{eventId}`, `reminders://lists`, `reminders://reminders`,
+  `reminders://lists/{listId}{?completed}` and
+  `reminders://reminders/{reminderId}`. A window defaults to today and the six
+  days after and spans at most a year; identifiers are one percent-encoded
+  segment. Listing never asks for access: the four fixed resources always, one
+  per calendar and per list only once full access is granted. A 2026-07-28
+  client is told a read and the list stay fresh for a minute (`Private`), the
+  templates an hour (`Public`). An unknown URI or id is `-32002`, a bad
+  parameter `-32602`. Listing and reading run on the EventKit thread.
+- `RemindersManager::fetch_list_reminders(list_id, include_completed)`: one
+  list's reminders by identifier (a title can name two lists), refusing an id
+  that is not a reminder list's.
 - **MCP tasks, as the SEP-2663 extension** (`io.modelcontextprotocol/tasks`,
   offered on both revisions), version 0.8.0 — a call to `list_reminders`,
   `list_events`, `search`, `batch_delete`, `batch_move`, `batch_update`,

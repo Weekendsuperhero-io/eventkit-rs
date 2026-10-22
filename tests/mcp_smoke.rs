@@ -552,3 +552,84 @@ fn mcp_refuses_tasks_methods_without_the_extension() {
     let resp = c.request("tasks/get", json!({ "taskId": "nope" }));
     assert_eq!(resp["error"]["code"], -32021, "{resp}");
 }
+
+/// The handshake names the server, not the SDK: without its own server info
+/// it answered `rmcp` and rmcp's version.
+#[test]
+fn mcp_names_itself_calendar() {
+    let mut c = McpClient::spawn();
+    let resp = c.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        }),
+    );
+    let info = &resp["result"]["serverInfo"];
+    assert_eq!(info["name"], "calendar", "{resp}");
+    assert_eq!(info["title"], "Calendar & Reminders", "{resp}");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"), "{resp}");
+    assert!(
+        resp["result"]["capabilities"]["resources"].is_object(),
+        "resources are advertised: {resp}"
+    );
+}
+
+/// Calendars and reminders are resources, listed WITHOUT asking for access: a
+/// host lists them when it connects, which must never raise the consent
+/// dialog. The fixed four are there whatever this process has been granted;
+/// one per calendar and per list follow only where full access already is.
+#[test]
+fn mcp_lists_calendars_and_reminders_as_resources() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let resp = c.request("resources/list", json!({}));
+    let uris: Vec<&str> = resp["result"]["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a resources array: {resp}"))
+        .iter()
+        .filter_map(|r| r["uri"].as_str())
+        .collect();
+    for fixed in [
+        "calendar://calendars",
+        "calendar://events",
+        "reminders://lists",
+        "reminders://reminders",
+    ] {
+        assert!(uris.contains(&fixed), "{fixed} is listed: {uris:?}");
+    }
+
+    let resp = c.request("resources/templates/list", json!({}));
+    let templates: Vec<&str> = resp["result"]["resourceTemplates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a resourceTemplates array: {resp}"))
+        .iter()
+        .filter_map(|t| t["uriTemplate"].as_str())
+        .collect();
+    assert_eq!(
+        templates,
+        [
+            "calendar://events{?from,to}",
+            "calendar://calendars/{calendarId}/events{?from,to}",
+            "calendar://events/{eventId}",
+            "reminders://lists/{listId}{?completed}",
+            "reminders://reminders/{reminderId}",
+        ]
+    );
+}
+
+/// A URI naming nothing here is `-32002`, a bad parameter `-32602`: both are
+/// answered before anything touches the store, so neither needs access.
+#[test]
+fn mcp_refuses_unknown_and_malformed_resource_uris() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let resp = c.request("resources/read", json!({"uri": "calendar://nope"}));
+    assert_eq!(resp["error"]["code"], -32002, "{resp}");
+    let resp = c.request(
+        "resources/read",
+        json!({"uri": "calendar://events?from=tomorrow"}),
+    );
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+}
