@@ -1,754 +1,834 @@
-//! MCP task surface (SEP-1686) for the EventKit server.
+//! MCP Tasks (SEP-2663, the `io.modelcontextprotocol/tasks` extension): a slow
+//! tool call becomes a task the client polls, instead of a request it has to
+//! hold open past its own timeout.
 //!
-//! Some EventKit operations are genuinely slow — a full-calendar scan, a
-//! multi-hundred-item `batch_*` — slow enough that a host may time the call out
-//! before it finishes. A task-augmented `tools/call` returns a task id
-//! immediately and runs the work in the background; the caller polls
-//! `tasks/get` / `tasks/result`, or waits for the status notification the
-//! server pushes on every transition.
+//! **The server decides, and decides late.** A call becomes a task only when
+//! all four hold: the tool is one of [`TASK_TOOLS`], the client declared the
+//! extension, the call is still running after [`TaskConfig::promote_after`],
+//! and admission ([`TaskConfig::max_active`], [`TaskConfig::max_tracked`])
+//! lets it in. Anything else runs exactly as a plain call always has, so a
+//! client that never declared tasks sees no difference at all.
 //!
-//! Deliberately leaner than `agentmail-mcp`'s equivalent. That server needs
-//! per-account serialization of destructive work and opaque paging cursors
-//! because IMAP mutations race across accounts. EventKit has one local store
-//! and no accounts, so this keeps the parts that matter — bounded memory, a
-//! result that survives repeated polls, real cancellation — and skips the rest.
+//! **The token rule.** rmcp cancels a request's token when it sends that
+//! request's response. A task's response is the `CreateTaskResult`, sent the
+//! moment the call is promoted, so an operation running on the request's token
+//! would cancel itself right there. Every promotable operation therefore runs
+//! on a child of the server's own lifetime token, linked to the request's
+//! token only while it is still a request.
+//!
+//! **Threads.** The operation runs on the one EventKit thread
+//! (`mcp_thread.rs`), like every other call: EventKit stores are cached per
+//! thread, so any other thread would build a store of its own (see
+//! [`super::EventKitServer`]). Only the bookkeeping — promotion, the task's
+//! status, the request's token — stays on rmcp's runtime. EventKit calls take
+//! turns on that thread, so a promoted call holds it while it runs, which is
+//! why [`TaskConfig::max_active`] is small.
+//!
+//! **Cancellation is cooperative.** `tasks/cancel` cancels the operation's
+//! token; a batch stops between items ([`stop_requested`]), and a single
+//! EventKit call runs to its end. A task whose tool saw the cancellation is
+//! `cancelled`; one that finished first is `completed`. rmcp's TTL is the only
+//! hard stop, and even it cancels the token first, so a synchronous batch (which
+//! an abort cannot reach) stops between items. Closing the connection is not a
+//! hard stop: an operation still running when the shutdown grace ends is
+//! detached and stops at its next check (see [`Operation`]).
+//!
+//! **Progress.** After promotion a batch reports how far it got as the task's
+//! status message, and `tasks/get` carries the numbers under
+//! [`PROGRESS_META_KEY`].
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    future::Future,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolResult, ContentBlock, Task, TaskStatus};
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use rmcp::{
+    ErrorData as McpError,
+    model::{
+        CallToolResponse, CallToolResult, CreateTaskResult, GetTaskResult, InputResponses,
+        MetaObject, Task,
+    },
+    task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions},
+};
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-/// How long a terminal task stays queryable before pruning.
-pub(super) const TASK_TTL_MS: u64 = 3_600_000; // 1 hour
+/// The tools a call to which may become a task: full-calendar and full-list
+/// scans, the batches, and the two that wait on the user or the hardware (the
+/// consent dialog, a location fix).
+pub(super) const TASK_TOOLS: &[&str] = &[
+    "list_reminders",
+    "list_events",
+    "search",
+    "batch_delete",
+    "batch_move",
+    "batch_update",
+    "request_access",
+    "get_current_location",
+];
 
-/// Concurrently RUNNING tasks. EventKit work is I/O against a single local
-/// store; letting an agent queue hundreds of scans would thrash it.
-pub(super) const MAX_ACTIVE_TASKS: usize = 16;
+/// The `_meta` key under which `tasks/get` reports a running task's latest
+/// progress, as `{"progress": n, "total": m}`.
+pub(super) const PROGRESS_META_KEY: &str = "io.agentmuse/progress";
 
-/// Total tracked tasks, running plus terminal-but-not-yet-pruned.
-pub(super) const MAX_TRACKED_TASKS: usize = 256;
-
-/// Max tasks returned by one `tasks/list`.
-pub(super) const TASK_PAGE_SIZE: usize = 50;
-
-/// Current time as an RFC 3339 string, matching `Task`'s timestamp fields.
-pub(super) fn now_iso8601() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TaskConfig {
+    /// How long a call runs as a plain request before it may become a task.
+    pub(super) promote_after: Duration,
+    /// rmcp's hard stop: a task still running this long after it was created
+    /// is aborted and marked `failed`, and a finished one is kept this long
+    /// after it ends.
+    pub(super) ttl: Duration,
+    /// The polling interval the task suggests to the client.
+    pub(super) poll_interval: Duration,
+    /// Tasks running at once, each queued on the one EventKit thread. A call
+    /// past this stays a request.
+    pub(super) max_active: usize,
+    /// Tasks held at once, running and finished. A call past this stays a
+    /// request.
+    pub(super) max_tracked: usize,
+    /// How long running tasks get to stop when the connection closes, before
+    /// whatever is left is detached (see [`Operation`]).
+    pub(super) shutdown_grace: Duration,
 }
 
-fn now_millis() -> u64 {
-    chrono::Utc::now().timestamp_millis().max(0) as u64
+impl TaskConfig {
+    pub(super) const DEFAULT: Self = Self {
+        promote_after: Duration::from_secs(1),
+        ttl: Duration::from_secs(60 * 60),
+        poll_interval: Duration::from_secs(1),
+        max_active: 4,
+        max_tracked: 256,
+        shutdown_grace: Duration::from_secs(2),
+    };
 }
 
-/// A task's result slot plus a wake-up for anyone awaiting it.
+tokio::task_local! {
+    /// The promotable call the current tool is running for, if any.
+    static TOOL_RUN: Arc<ToolRun>;
+}
+
+/// One promotable call, as seen by the tool running it.
 #[derive(Default)]
-pub(super) struct TaskCompletion {
-    result: parking_lot::Mutex<Option<Result<CallToolResult, McpError>>>,
-    changed: Notify,
+pub(super) struct ToolRun {
+    /// Set once, when the call is promoted: from then on it is a task.
+    task: OnceLock<PromotedRun>,
+    /// Whether the operation saw a cancellation ([`stop_requested`]).
+    cancel_observed: AtomicBool,
 }
 
-impl TaskCompletion {
-    pub(super) fn new() -> Self {
-        Self::default()
+struct PromotedRun {
+    context: TaskContext,
+    progress: Arc<ProgressBoard>,
+}
+
+impl ToolRun {
+    fn current() -> Option<Arc<Self>> {
+        TOOL_RUN.try_with(Arc::clone).ok()
     }
 
-    /// Publish the worker's result — first write wins.
-    ///
-    /// First-write-wins matters for cancellation: `cancel` publishes a
-    /// cancelled result immediately, and a worker that finishes a moment later
-    /// must not overwrite it with a success the caller was never promised.
-    pub(super) fn complete(&self, result: Result<CallToolResult, McpError>) {
-        let mut slot = self.result.lock();
-        if slot.is_none() {
-            *slot = Some(result);
-            drop(slot);
-            self.changed.notify_waiters();
+    fn cancel_observed(&self) -> bool {
+        self.cancel_observed.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether the call this tool runs for has been cancelled, recording that the
+/// tool saw it. A batch checks this between items.
+pub(super) fn stop_requested(ct: &CancellationToken) -> bool {
+    let cancelled = ct.is_cancelled();
+    if cancelled && let Some(run) = ToolRun::current() {
+        run.cancel_observed.store(true, Ordering::Relaxed);
+    }
+    cancelled
+}
+
+/// Report how far a batch got, once its call is a task (a plain request has
+/// no progress token to report on here).
+pub(super) fn report_progress(done: usize, total: usize) {
+    let Some(run) = ToolRun::current() else {
+        return;
+    };
+    let Some(promoted) = run.task.get() else {
+        return;
+    };
+    promoted
+        .context
+        .set_status_message(format!("{done} of {total}"));
+    promoted.progress.record(
+        promoted.context.task_id(),
+        u64::try_from(done).unwrap_or(u64::MAX),
+        u64::try_from(total).unwrap_or(u64::MAX),
+    );
+}
+
+/// Set the task's status message, once the call is one.
+pub(super) fn report_status(message: impl Into<String>) {
+    if let Some(promoted) = ToolRun::current().as_deref().and_then(|run| run.task.get()) {
+        promoted.context.set_status_message(message);
+    }
+}
+
+/// The latest progress of each task, for `tasks/get`.
+#[derive(Default)]
+struct ProgressBoard(parking_lot::Mutex<BTreeMap<String, (u64, u64)>>);
+
+impl ProgressBoard {
+    fn record(&self, task_id: &str, completed: u64, total: u64) {
+        self.0
+            .lock()
+            .insert(task_id.to_string(), (completed, total));
+    }
+
+    fn get(&self, task_id: &str) -> Option<(u64, u64)> {
+        self.0.lock().get(task_id).copied()
+    }
+
+    fn forget(&self, task_id: &str) {
+        self.0.lock().remove(task_id);
+    }
+}
+
+/// The spawned operation behind a call, with the token it runs on and the
+/// connection's lifetime.
+///
+/// Dropped before it ends, it is stopped, and how depends on why:
+///
+/// - The connection is shutting down (its lifetime is cancelled, so this
+///   operation's token already is): DETACHED. It runs on to its next check
+///   and ends there, the way any cancelled call ends; an abort at an
+///   arbitrary await could stop a batch between an item's change and its
+///   commit.
+/// - Anything else (rmcp's TTL, the one hard stop): its token is cancelled
+///   first, so a synchronous batch on the EventKit thread, which no abort can
+///   reach, stops between items; then it is aborted.
+struct Operation {
+    handle: JoinHandle<Result<CallToolResponse, McpError>>,
+    token: CancellationToken,
+    lifetime: CancellationToken,
+}
+
+impl Operation {
+    async fn join(&mut self) -> Result<Result<CallToolResponse, McpError>, JoinError> {
+        (&mut self.handle).await
+    }
+}
+
+impl Drop for Operation {
+    fn drop(&mut self) {
+        self.token.cancel();
+        if !self.lifetime.is_cancelled() {
+            self.handle.abort();
+        }
+    }
+}
+
+/// The tasks of one connection: the rmcp store, the lifetime every operation
+/// token descends from, and the admission bounds.
+pub(super) struct TaskRuntime {
+    manager: TaskManager,
+    lifetime: CancellationToken,
+    config: TaskConfig,
+    /// Tasks created here that rmcp may still hold, with when they were made.
+    tracked: parking_lot::Mutex<VecDeque<(String, Instant)>>,
+    progress: Arc<ProgressBoard>,
+}
+
+impl TaskRuntime {
+    pub(super) fn new(config: TaskConfig) -> Self {
+        Self {
+            manager: TaskManager::new(),
+            lifetime: CancellationToken::new(),
+            config,
+            tracked: parking_lot::Mutex::new(VecDeque::new()),
+            progress: Arc::new(ProgressBoard::default()),
         }
     }
 
-    fn cancel(&self, task_id: &str) {
-        self.complete(Ok(CallToolResult::error(vec![ContentBlock::text(
-            format!("Task {task_id} was cancelled before completion."),
-        )])));
+    /// A token for one operation: a child of this connection's lifetime, so
+    /// it outlives the request that started it (see the module doc).
+    pub(super) fn operation_token(&self) -> CancellationToken {
+        self.lifetime.child_token()
     }
 
-    fn snapshot(&self) -> Option<Result<CallToolResult, McpError>> {
-        self.result.lock().clone()
-    }
-
-    /// Block until the task reaches a result.
+    /// Run one promotable call.
     ///
-    /// `request_cancel` cancels THIS `tasks/result` request, not the task —
-    /// a caller giving up on waiting must not kill work another caller may
-    /// still want.
-    pub(super) async fn wait(
+    /// `operation` runs on the EventKit thread (`mcp_thread.rs`), the one
+    /// thread that holds the store, with this call's `ToolRun` in scope there:
+    /// a tokio task-local does not follow work to another runtime, so it is
+    /// set on the spawned operation itself, where a batch reads it to report
+    /// progress and to record that it saw a cancellation.
+    ///
+    /// `operation` runs on `operation_ct` (from [`Self::operation_token`]).
+    /// While the call is a request, a cancellation of `request_ct` (a
+    /// `notifications/cancelled`, or the connection closing) is passed on to
+    /// the operation, which then stops where a plain call stops. Once
+    /// promoted, the request's token is left behind: rmcp cancels it as it
+    /// sends the `CreateTaskResult`.
+    pub(super) async fn run_call<F>(
         &self,
-        request_cancel: &CancellationToken,
-    ) -> Result<CallToolResult, McpError> {
+        tool: &str,
+        request_ct: CancellationToken,
+        operation_ct: CancellationToken,
+        operation: F,
+    ) -> Result<CallToolResponse, McpError>
+    where
+        F: Future<Output = Result<CallToolResponse, McpError>> + Send + 'static,
+    {
+        let run = Arc::new(ToolRun::default());
+        let mut operation = Operation {
+            handle: super::eventkit_thread::spawn(TOOL_RUN.scope(Arc::clone(&run), operation)),
+            token: operation_ct.clone(),
+            lifetime: self.lifetime.clone(),
+        };
+        let promote_at = tokio::time::sleep(self.config.promote_after);
+        tokio::pin!(promote_at);
+        let mut promotable = true;
         loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            // Arm BEFORE snapshotting, or a result published in between would
-            // be missed and this would wait forever.
-            changed.as_mut().enable();
-            if let Some(result) = self.snapshot() {
-                return result;
-            }
             tokio::select! {
-                () = &mut changed => {}
-                () = request_cancel.cancelled() => {
-                    return Err(McpError::internal_error(
-                        "tasks/result request was cancelled",
-                        None,
-                    ));
+                biased;
+                joined = operation.join() => return settle_request(joined),
+                () = request_ct.cancelled() => {
+                    operation_ct.cancel();
+                    return settle_request(operation.join().await);
+                }
+                () = &mut promote_at, if promotable => {
+                    match self.promote(tool, &run, operation, operation_ct.clone()) {
+                        Ok(task) => {
+                            return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+                        }
+                        // Not admitted: the call carries on as a request.
+                        Err(not_admitted) => {
+                            operation = not_admitted;
+                            promotable = false;
+                        }
+                    }
                 }
             }
         }
     }
-}
 
-/// Marks a task terminal if its worker dies without reporting.
-///
-/// **Why this exists.** A task is moved out of `Working` in exactly one place:
-/// the worker itself, *after* `call_tool` returns. If that call unwinds, neither
-/// the result nor the transition is ever published, and the task is stranded:
-/// `prune_expired` skips it (it only prunes tasks with a `terminal_at_ms`), it
-/// holds an active slot forever, and any `tasks/result` waiter blocks on a slot
-/// that will never be filled. After [`MAX_ACTIVE_TASKS`] such panics `admit`
-/// refuses *every* future task for the life of the process.
-///
-/// That is not hypothetical for this crate. `objc2` declares most EventKit
-/// accessors non-null while EventKit returns NULL to an unauthorized process,
-/// which panics — the failure mode `AUTHORIZATION_PLAN.md` records as a live
-/// outage — and several conversion paths unwrap on user data (a reminder URL
-/// whose `absoluteString` is nil, an out-of-range date, a local time inside a
-/// DST gap). Nothing catches those: this crate and rmcp both run without
-/// `catch_unwind`, and there is no `panic = "abort"`, so the unwind stops at the
-/// tokio task boundary and simply discards the rest of the worker.
-///
-/// `Drop` runs during that unwind, which is what makes a guard the right shape
-/// here rather than a `catch_unwind` the async boundary cannot offer. It is also
-/// correct for a plain early return, should the worker ever grow one.
-///
-/// The guard publishes through [`TaskCompletion::complete`], whose first-write-
-/// wins rule means a cancellation that already landed is never overwritten.
-pub(super) struct TaskFailureGuard {
-    task_id: String,
-    completion: Arc<TaskCompletion>,
-    manager: Arc<parking_lot::Mutex<TaskManager>>,
-    armed: bool,
-}
-
-impl TaskFailureGuard {
-    pub(super) fn new(
-        task_id: String,
-        completion: Arc<TaskCompletion>,
-        manager: Arc<parking_lot::Mutex<TaskManager>>,
-    ) -> Self {
-        Self {
-            task_id,
-            completion,
-            manager,
-            armed: true,
+    /// Turn a running call into a task, or hand the operation back when
+    /// admission refuses it.
+    fn promote(
+        &self,
+        tool: &str,
+        run: &Arc<ToolRun>,
+        operation: Operation,
+        operation_ct: CancellationToken,
+    ) -> Result<Task, Operation> {
+        let mut tracked = self.tracked.lock();
+        if !self.admits(&mut tracked) {
+            tracing::debug!(
+                target: "eventkit",
+                tool,
+                running = self.manager.running_task_count(),
+                tracked = tracked.len(),
+                "slow call stays a request: task admission is full"
+            );
+            return Err(operation);
         }
-    }
-
-    /// The worker reported for itself — stand down.
-    pub(super) fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TaskFailureGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.completion
-            .complete(Ok(CallToolResult::error(vec![ContentBlock::text(
-                format!(
-                    "Task {} failed: the tool panicked and produced no result.",
-                    self.task_id
-                ),
-            )])));
-        self.manager
-            .lock()
-            .transition(&self.task_id, TaskStatus::Failed);
-    }
-}
-
-/// One tracked task.
-pub(super) struct ManagedTask {
-    pub(super) meta: Task,
-    pub(super) completion: Arc<TaskCompletion>,
-    pub(super) cancel: CancellationToken,
-    /// `None` once [`TaskManager::cancel_task`] has handed it out to be
-    /// aborted — see the re-entrancy note there.
-    pub(super) handle: Option<JoinHandle<()>>,
-    /// When this task reached a terminal state, for TTL pruning.
-    terminal_at_ms: Option<u64>,
-}
-
-impl ManagedTask {
-    /// Build a running task. `terminal_at_ms` stays private so only
-    /// [`TaskManager`] can mark a task terminal — the TTL clock must not be
-    /// settable from outside, or pruning becomes unpredictable.
-    pub(super) fn running(
-        meta: Task,
-        completion: Arc<TaskCompletion>,
-        cancel: CancellationToken,
-        handle: JoinHandle<()>,
-    ) -> Self {
-        Self {
-            meta,
-            completion,
-            cancel,
-            handle: Some(handle),
-            terminal_at_ms: None,
-        }
-    }
-
-    fn is_terminal(&self) -> bool {
-        !matches!(
-            self.meta.status,
-            TaskStatus::Working | TaskStatus::InputRequired
-        )
-    }
-}
-
-/// Tracked tasks, oldest first.
-///
-/// A `Vec` rather than a map: `MAX_TRACKED_TASKS` is 256, so a linear scan by
-/// id is trivially fast, and insertion order — which paging and oldest-first
-/// eviction both need — comes for free. A map would have required a parallel
-/// order vec that could drift out of sync with it.
-#[derive(Default)]
-pub(super) struct TaskManager {
-    tasks: Vec<(String, ManagedTask)>,
-}
-
-impl TaskManager {
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
-
-    fn active_count(&self) -> usize {
-        self.tasks.iter().filter(|(_, t)| !t.is_terminal()).count()
-    }
-
-    fn find(&self, task_id: &str) -> Option<&ManagedTask> {
-        self.tasks
-            .iter()
-            .find(|(id, _)| id == task_id)
-            .map(|(_, t)| t)
-    }
-
-    fn find_mut(&mut self, task_id: &str) -> Option<&mut ManagedTask> {
-        self.tasks
-            .iter_mut()
-            .find(|(id, _)| id == task_id)
-            .map(|(_, t)| t)
-    }
-
-    fn unknown(task_id: &str) -> McpError {
-        McpError::invalid_params(format!("unknown task: {task_id}"), None)
-    }
-
-    /// Admit a new task, or refuse with a descriptive error.
-    ///
-    /// Refusing loudly beats silently queueing: an agent that has saturated the
-    /// server should learn now, not after N pending scans finish.
-    pub(super) fn admit(&mut self) -> Result<(), McpError> {
-        self.prune_expired();
-        if self.active_count() >= MAX_ACTIVE_TASKS {
-            return Err(McpError::internal_error(
-                format!(
-                    "too many tasks already running (limit {MAX_ACTIVE_TASKS}); \
-                         wait for one to finish or cancel it with tasks/cancel"
-                ),
-                None,
-            ));
-        }
-        if self.tasks.len() >= MAX_TRACKED_TASKS {
-            self.evict_oldest_terminal();
-        }
-        Ok(())
-    }
-
-    pub(super) fn insert(&mut self, task_id: String, task: ManagedTask) {
-        self.tasks.push((task_id, task));
-    }
-
-    /// Record a status transition. Returns the updated `Task` when the status
-    /// ACTUALLY changed, so callers push a notification exactly once.
-    ///
-    /// **Terminal is final.** A worker that finishes a moment after
-    /// `tasks/cancel` must not downgrade `Cancelled` to `Completed`/`Failed`,
-    /// and neither must [`TaskFailureGuard`] when that worker panics instead.
-    /// The caller was already told the task was cancelled, and
-    /// [`TaskCompletion::complete`] has already frozen the matching result —
-    /// letting the status drift would contradict both. Refusing here is also
-    /// what makes the "exactly once" promise above true for the cancel race,
-    /// which is otherwise the one case that would push a second notification.
-    pub(super) fn transition(&mut self, task_id: &str, status: TaskStatus) -> Option<Task> {
-        let entry = self.find_mut(task_id)?;
-        if entry.is_terminal() || entry.meta.status == status {
-            return None;
-        }
-        entry.meta.status = status;
-        entry.meta.last_updated_at = now_iso8601();
-        if entry.is_terminal() {
-            entry.terminal_at_ms = Some(now_millis());
-        }
-        Some(entry.meta.clone())
-    }
-
-    pub(super) fn task_info(&self, task_id: &str) -> Result<Task, McpError> {
-        self.find(task_id)
-            .map(|t| t.meta.clone())
-            .ok_or_else(|| Self::unknown(task_id))
-    }
-
-    pub(super) fn completion(&self, task_id: &str) -> Result<Arc<TaskCompletion>, McpError> {
-        self.find(task_id)
-            .map(|t| Arc::clone(&t.completion))
-            .ok_or_else(|| Self::unknown(task_id))
-    }
-
-    /// Cancel a task: signal the worker, publish a cancelled result so any
-    /// waiter unblocks, and mark it terminal.
-    ///
-    /// Returns the worker's handle so the CALLER can abort it **after dropping
-    /// the manager lock**. Aborting here would deadlock: `JoinHandle::abort` can
-    /// drop the future inline on the calling thread when the task is not
-    /// currently being polled, that drop runs [`TaskFailureGuard::drop`], and
-    /// the guard takes this same non-reentrant mutex. Handing the handle back is
-    /// the simplest way to keep the abort outside the critical section.
-    pub(super) fn cancel_task(
-        &mut self,
-        task_id: &str,
-    ) -> Result<(Task, Option<JoinHandle<()>>), McpError> {
-        let entry = self
-            .find_mut(task_id)
-            .ok_or_else(|| Self::unknown(task_id))?;
-        if entry.is_terminal() {
-            // Already finished — cancelling is a no-op, not an error. Repeat
-            // cancels are idempotent (see the tool's `idempotent_hint`).
-            return Ok((entry.meta.clone(), None));
-        }
-        entry.cancel.cancel();
-        entry.completion.cancel(task_id);
-        entry.meta.status = TaskStatus::Cancelled;
-        entry.meta.last_updated_at = now_iso8601();
-        entry.terminal_at_ms = Some(now_millis());
-        // The token asks the worker to stop COOPERATIVELY, which most EventKit
-        // work cannot honour — the objc calls are synchronous and never observe
-        // the token — so the caller must abort as well, or the future would run
-        // to completion after the caller was told it was cancelled.
-        Ok((entry.meta.clone(), entry.handle.take()))
-    }
-
-    /// One page of tasks, newest first.
-    pub(super) fn list_page(&mut self) -> Vec<Task> {
-        self.prune_expired();
-        self.tasks
-            .iter()
-            .rev()
-            .map(|(_, t)| t.meta.clone())
-            .take(TASK_PAGE_SIZE)
-            .collect()
-    }
-
-    /// Drop terminal tasks past their TTL.
-    pub(super) fn prune_expired(&mut self) {
-        let now = now_millis();
-        self.tasks.retain(|(_, t)| {
-            !t.terminal_at_ms
-                .is_some_and(|at| now.saturating_sub(at) > TASK_TTL_MS)
+        let run = Arc::clone(run);
+        let progress = Arc::clone(&self.progress);
+        let options = TaskOptions::new()
+            .with_ttl_ms(duration_ms(self.config.ttl))
+            .with_poll_interval_ms(duration_ms(self.config.poll_interval))
+            .with_status_message(format!("Running {tool}"));
+        let task = self.manager.spawn(options, move |context| {
+            // From here on the call is a task: progress becomes its status.
+            let _ = run.task.set(PromotedRun {
+                context: context.clone(),
+                progress,
+            });
+            Box::pin(drive_task(operation, operation_ct, run, context))
         });
+        tracked.push_back((task.task_id.clone(), Instant::now()));
+        tracing::info!(
+            target: "eventkit",
+            tool,
+            task = %task.task_id,
+            "slow call became a task"
+        );
+        Ok(task)
     }
 
-    fn evict_oldest_terminal(&mut self) {
-        if let Some(pos) = self.tasks.iter().position(|(_, t)| t.is_terminal()) {
-            self.tasks.remove(pos);
+    /// Whether one more task fits, after forgetting the ones rmcp has evicted.
+    fn admits(&self, tracked: &mut VecDeque<(String, Instant)>) -> bool {
+        if self.lifetime.is_cancelled() {
+            return false;
         }
+        // rmcp keeps a finished task for one TTL after it ends, so a task
+        // younger than one TTL cannot have been evicted yet.
+        tracked.retain(|(task_id, created)| {
+            let held =
+                created.elapsed() < self.config.ttl || self.manager.get_task(task_id).is_ok();
+            if !held {
+                self.progress.forget(task_id);
+            }
+            held
+        });
+        self.manager.running_task_count() < self.config.max_active
+            && tracked.len() < self.config.max_tracked
     }
+
+    /// `tasks/get`, with the latest progress under [`PROGRESS_META_KEY`].
+    pub(super) fn get(&self, task_id: &str) -> Result<GetTaskResult, McpError> {
+        let mut result = GetTaskResult::new(self.manager.get_task(task_id)?);
+        if let Some((progress, total)) = self.progress.get(task_id) {
+            let mut meta = MetaObject::default();
+            meta.0.insert(
+                PROGRESS_META_KEY.to_string(),
+                serde_json::json!({ "progress": progress, "total": total }),
+            );
+            result.meta = Some(meta);
+        }
+        Ok(result)
+    }
+
+    /// `tasks/update`. No tool here asks for input mid-task, so this only
+    /// validates the task id; rmcp ignores responses nothing is waiting for.
+    pub(super) fn update(&self, task_id: &str, responses: InputResponses) -> Result<(), McpError> {
+        self.manager.update_task(task_id, responses)
+    }
+
+    /// `tasks/cancel`: records the request; [`drive_task`] passes it on.
+    pub(super) fn cancel(&self, task_id: &str) -> Result<(), McpError> {
+        self.manager.cancel_task(task_id)
+    }
+
+    /// The connection is gone, and its tasks with it: nothing can poll them
+    /// any more. Ask every operation to stop, give them
+    /// [`TaskConfig::shutdown_grace`] to do so, then drop the tasks. An
+    /// operation still running is detached rather than aborted (see
+    /// [`Operation`]): it stops at its next check.
+    pub(super) async fn shutdown(&self) {
+        self.lifetime.cancel();
+        let deadline = tokio::time::Instant::now() + self.config.shutdown_grace;
+        while self.manager.running_task_count() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.manager.shutdown();
+    }
+}
+
+/// The body of a task: wait for the operation, passing `tasks/cancel` on to it.
+async fn drive_task(
+    mut operation: Operation,
+    operation_ct: CancellationToken,
+    run: Arc<ToolRun>,
+    context: TaskContext,
+) -> Result<CallToolResult, TaskExit> {
+    let joined = tokio::select! {
+        biased;
+        joined = operation.join() => joined,
+        () = context.cancelled() => {
+            operation_ct.cancel();
+            operation.join().await
+        }
+    };
+    settle_task(joined, &run, &context)
+}
+
+/// A task's terminal status. An operation that stopped because it was asked
+/// to is `cancelled`. An `isError` result is otherwise `completed`: SEP-2663
+/// reserves `failed` for a call that produced no result.
+fn settle_task(
+    joined: Result<Result<CallToolResponse, McpError>, JoinError>,
+    run: &ToolRun,
+    context: &TaskContext,
+) -> Result<CallToolResult, TaskExit> {
+    if context.is_cancel_requested() && run.cancel_observed() {
+        return Err(TaskExit::Cancelled);
+    }
+    match joined {
+        Ok(Ok(CallToolResponse::Complete(result))) => Ok(result),
+        Ok(Ok(_)) => Err(TaskExit::Error(McpError::internal_error(
+            "the tool answered with something other than a result, which a task cannot carry",
+            None,
+        ))),
+        Ok(Err(error)) => Err(TaskExit::Error(error)),
+        Err(join_error) => Err(TaskExit::Error(operation_lost(&join_error))),
+    }
+}
+
+/// A call's answer while it is still a request.
+fn settle_request(
+    joined: Result<Result<CallToolResponse, McpError>, JoinError>,
+) -> Result<CallToolResponse, McpError> {
+    joined.unwrap_or_else(|join_error| Err(operation_lost(&join_error)))
+}
+
+fn operation_lost(join_error: &JoinError) -> McpError {
+    if join_error.is_panic() {
+        McpError::internal_error("the tool panicked", None)
+    } else {
+        McpError::internal_error("the tool was stopped before it finished", None)
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::{ContentBlock, TaskStatus};
 
-    fn managed(status: TaskStatus) -> ManagedTask {
-        let now = now_iso8601();
-        ManagedTask::running(
-            Task::new("t".to_string(), status, now.clone(), now),
-            Arc::new(TaskCompletion::new()),
-            CancellationToken::new(),
-            tokio::runtime::Handle::try_current()
-                .map(|h| h.spawn(async {}))
-                .expect("tests run on a tokio runtime"),
-        )
-    }
-
-    /// Backdate a terminal task's TTL clock so pruning can be tested without
-    /// waiting out `TASK_TTL_MS` (an hour).
-    ///
-    /// Reaches into the private field deliberately: the alternative is a
-    /// production-visible clock parameter that exists only for tests. The task
-    /// is made terminal through the REAL path (`transition`) first, so only the
-    /// passage of time is faked.
-    fn backdate_terminal(mgr: &mut TaskManager, task_id: &str, age_ms: u64) {
-        let entry = mgr
-            .find_mut(task_id)
-            .unwrap_or_else(|| panic!("{task_id} must exist"));
-        assert!(
-            entry.terminal_at_ms.is_some(),
-            "{task_id} must already be terminal before backdating"
-        );
-        entry.terminal_at_ms = Some(now_millis().saturating_sub(age_ms));
-    }
-
-    // ── Memory bounds: TTL pruning and eviction ──────────────────────────
-    //
-    // These two paths are the ONLY things keeping the task table bounded. If
-    // either silently stops working the manager grows without limit for the
-    // life of the process, which no functional test would notice.
-
-    /// A terminal task past its TTL must be dropped.
-    #[tokio::test]
-    async fn prune_drops_terminal_tasks_past_the_ttl() {
-        let mut mgr = TaskManager::new();
-        mgr.insert("old".into(), managed(TaskStatus::Working));
-        mgr.transition("old", TaskStatus::Completed);
-        backdate_terminal(&mut mgr, "old", TASK_TTL_MS + 1_000);
-
-        mgr.prune_expired();
-
-        assert!(
-            mgr.task_info("old").is_err(),
-            "a terminal task older than the TTL must be pruned"
-        );
-    }
-
-    /// Pruning must NOT take tasks that are still inside the TTL, or a client
-    /// polling `tasks/result` would lose a result it is entitled to.
-    #[tokio::test]
-    async fn prune_keeps_terminal_tasks_inside_the_ttl() {
-        let mut mgr = TaskManager::new();
-        mgr.insert("fresh".into(), managed(TaskStatus::Working));
-        mgr.transition("fresh", TaskStatus::Completed);
-        backdate_terminal(&mut mgr, "fresh", TASK_TTL_MS / 2);
-
-        mgr.prune_expired();
-
-        assert!(
-            mgr.task_info("fresh").is_ok(),
-            "a terminal task still inside the TTL must be kept"
-        );
-    }
-
-    /// Pruning must never touch a RUNNING task, however old. A long scan has no
-    /// `terminal_at_ms`, and dropping it would orphan the worker.
-    #[tokio::test]
-    async fn prune_never_drops_a_running_task() {
-        let mut mgr = TaskManager::new();
-        mgr.insert("busy".into(), managed(TaskStatus::Working));
-
-        mgr.prune_expired();
-
-        assert!(
-            mgr.task_info("busy").is_ok(),
-            "a Working task has no TTL clock and must survive pruning"
-        );
-    }
-
-    /// At `MAX_TRACKED_TASKS`, admitting one more must evict the OLDEST
-    /// terminal task — insertion order is what makes that well-defined.
-    #[tokio::test]
-    async fn admit_evicts_the_oldest_terminal_task_when_full() {
-        let mut mgr = TaskManager::new();
-        for i in 0..MAX_TRACKED_TASKS {
-            let id = format!("t{i}");
-            mgr.insert(id.clone(), managed(TaskStatus::Working));
-            mgr.transition(&id, TaskStatus::Completed);
+    fn quick() -> TaskConfig {
+        TaskConfig {
+            promote_after: Duration::from_millis(20),
+            ..TaskConfig::DEFAULT
         }
-        assert_eq!(mgr.tasks.len(), MAX_TRACKED_TASKS);
-
-        mgr.admit().expect("terminal tasks don't block admission");
-
-        assert!(
-            mgr.tasks.len() < MAX_TRACKED_TASKS,
-            "admitting at capacity must free a slot"
-        );
-        assert!(
-            mgr.task_info("t0").is_err(),
-            "the OLDEST terminal task must be the one evicted"
-        );
-        assert!(
-            mgr.task_info("t1").is_ok(),
-            "eviction must take exactly one task"
-        );
     }
 
-    /// Eviction must prefer terminal tasks and leave running ones alone, even
-    /// when a running task is older — killing live work to make room would lose
-    /// a result the caller is still waiting on.
-    #[tokio::test]
-    async fn eviction_spares_running_tasks_even_when_they_are_oldest() {
-        let mut mgr = TaskManager::new();
-        // Oldest first: one running, then terminal tasks filling the table.
-        mgr.insert("running-oldest".into(), managed(TaskStatus::Working));
-        for i in 0..MAX_TRACKED_TASKS - 1 {
-            let id = format!("done{i}");
-            mgr.insert(id.clone(), managed(TaskStatus::Completed));
-            mgr.transition(&id, TaskStatus::Failed);
+    fn done(message: &str) -> Result<CallToolResponse, McpError> {
+        Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+            ContentBlock::text(message.to_string()),
+        ])))
+    }
+
+    async fn settled(runtime: &TaskRuntime, task_id: &str) -> GetTaskResult {
+        for _ in 0..200 {
+            let result = runtime.get(task_id).expect("task is held");
+            if result.task.status().is_terminal() {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(mgr.tasks.len(), MAX_TRACKED_TASKS);
-
-        mgr.admit().expect("only one task is running");
-
-        assert!(
-            mgr.task_info("running-oldest").is_ok(),
-            "a RUNNING task must never be evicted, even as the oldest entry"
-        );
-        assert!(
-            mgr.task_info("done0").is_err(),
-            "the oldest TERMINAL task must be evicted instead"
-        );
+        panic!("task {task_id} never settled");
     }
 
-    /// `transition` must report a change EXACTLY once — the caller pushes a
-    /// `notifications/tasks/status` off the return value, so a repeat would
-    /// duplicate the notification and a miss would lose it.
-    #[tokio::test]
-    async fn transition_reports_a_change_exactly_once() {
-        let mut mgr = TaskManager::new();
-        mgr.insert("t".into(), managed(TaskStatus::Working));
-
-        assert!(
-            mgr.transition("t", TaskStatus::Completed).is_some(),
-            "first transition must report the change"
-        );
-        assert!(
-            mgr.transition("t", TaskStatus::Completed).is_none(),
-            "repeat transition to the SAME status must report nothing"
-        );
-        assert!(
-            mgr.transition("unknown", TaskStatus::Completed).is_none(),
-            "unknown id must report nothing"
-        );
-    }
-
-    /// Cancelling must unblock a waiter rather than leave it hanging.
-    #[tokio::test]
-    async fn cancel_publishes_a_result_so_waiters_wake() {
-        let mut mgr = TaskManager::new();
-        mgr.insert("t".into(), managed(TaskStatus::Working));
-        let completion = mgr.completion("t").expect("task exists");
-
-        let (cancelled, aborted) = mgr.cancel_task("t").expect("cancel succeeds");
-        assert_eq!(cancelled.status, TaskStatus::Cancelled);
-        assert!(
-            aborted.is_some(),
-            "the worker handle must be handed back for the caller to abort"
-        );
-
-        let result = completion
-            .wait(&CancellationToken::new())
-            .await
-            .expect("a cancelled task still yields a result");
-        assert_eq!(result.is_error, Some(true));
-    }
-
-    /// Cancelling an already-terminal task is a no-op, not an error — the
-    /// tool advertises `idempotent_hint = true`.
-    #[tokio::test]
-    async fn cancelling_twice_is_idempotent() {
-        let mut mgr = TaskManager::new();
-        mgr.insert("t".into(), managed(TaskStatus::Working));
-        mgr.cancel_task("t").expect("first cancel");
-        let (second, aborted) = mgr.cancel_task("t").expect("second cancel must not error");
-        assert_eq!(second.status, TaskStatus::Cancelled);
-        assert!(
-            aborted.is_none(),
-            "an already-terminal task has no handle left to abort"
-        );
-    }
-
-    /// A worker result must not overwrite a cancellation that already landed.
-    #[tokio::test]
-    async fn cancellation_wins_a_race_with_a_late_worker() {
-        let completion = TaskCompletion::new();
-        completion.cancel("t");
-        completion.complete(Ok(CallToolResult::success(vec![ContentBlock::text(
-            "late",
-        )])));
-        let result = completion
-            .wait(&CancellationToken::new())
-            .await
-            .expect("result present");
-        assert_eq!(
-            result.is_error,
-            Some(true),
-            "the late success must NOT overwrite the cancellation"
-        );
-    }
-
-    /// Admission must refuse once too many tasks are RUNNING, while terminal
-    /// ones don't count against the cap.
-    #[tokio::test]
-    async fn admit_refuses_only_on_too_many_running() {
-        let mut mgr = TaskManager::new();
-        for i in 0..MAX_ACTIVE_TASKS {
-            mgr.insert(format!("run{i}"), managed(TaskStatus::Working));
+    fn task_id(response: Result<CallToolResponse, McpError>) -> String {
+        match response {
+            Ok(CallToolResponse::Task(created)) => created.task.task_id,
+            other => panic!("expected a task, got {other:?}"),
         }
-        assert!(mgr.admit().is_err(), "a full slate must refuse");
+    }
 
-        for i in 0..MAX_ACTIVE_TASKS {
-            mgr.transition(&format!("run{i}"), TaskStatus::Completed);
-        }
+    /// A call that finishes inside the budget is answered inline.
+    #[tokio::test]
+    async fn a_quick_call_stays_a_request() {
+        let runtime = TaskRuntime::new(quick());
+        let response = runtime
+            .run_call(
+                "list_events",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async { done("quick") },
+            )
+            .await;
+        assert!(matches!(response, Ok(CallToolResponse::Complete(_))));
+        assert!(runtime.tracked.lock().is_empty());
+    }
+
+    /// What an operation saw of where it ran: the thread's name, whether its
+    /// call's `ToolRun` was in scope, and whether that run was a task yet.
+    type Seen = Arc<parking_lot::Mutex<Option<(Option<String>, bool, bool)>>>;
+
+    fn look_around(seen: &Seen) {
+        let run = ToolRun::current();
+        *seen.lock() = Some((
+            std::thread::current().name().map(str::to_string),
+            run.is_some(),
+            run.is_some_and(|run| run.task.get().is_some()),
+        ));
+    }
+
+    /// A promotable call's tool runs on the one EventKit thread, where the
+    /// store lives — not on rmcp's worker, which would build a store of its
+    /// own — with its `ToolRun` in scope there, since a task-local does not
+    /// follow work onto another runtime by itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_mode_call_runs_on_the_eventkit_thread() {
+        let runtime = TaskRuntime::new(quick());
+        let seen = Seen::default();
+        let probe = Arc::clone(&seen);
+        let response = runtime
+            .run_call(
+                "list_events",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async move {
+                    look_around(&probe);
+                    done("quick")
+                },
+            )
+            .await;
+        assert!(matches!(response, Ok(CallToolResponse::Complete(_))));
+        let (thread, in_scope, promoted) = seen.lock().take().expect("the operation ran");
+        assert_eq!(thread.as_deref(), Some("eventkit"));
         assert!(
-            mgr.admit().is_ok(),
-            "terminal tasks must not count against the running cap"
+            in_scope,
+            "the call's ToolRun is in scope on the EventKit thread"
+        );
+        assert!(!promoted);
+    }
+
+    /// Promotion does not move the work: a task keeps running on the EventKit
+    /// thread, and its tool sees the promoted run, which is what progress
+    /// and status reports go through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promoted_task_runs_on_the_eventkit_thread_and_sees_its_run() {
+        let runtime = TaskRuntime::new(quick());
+        let seen = Seen::default();
+        let probe = Arc::clone(&seen);
+        let response = runtime
+            .run_call(
+                "batch_update_reminders",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    look_around(&probe);
+                    done("slow")
+                },
+            )
+            .await;
+        let id = task_id(response);
+        let finished = settled(&runtime, &id).await;
+        assert_eq!(finished.task.status(), TaskStatus::Completed);
+        let (thread, in_scope, promoted) = seen.lock().take().expect("the operation ran");
+        assert_eq!(thread.as_deref(), Some("eventkit"));
+        assert!(in_scope && promoted, "the tool sees its promoted run");
+    }
+
+    /// The token rule: rmcp cancels the request's token as it sends the
+    /// `CreateTaskResult`, and the task carries on regardless.
+    #[tokio::test]
+    async fn a_promoted_task_outlives_its_request_token() {
+        let runtime = TaskRuntime::new(quick());
+        let request_ct = CancellationToken::new();
+        let operation_ct = runtime.operation_token();
+        let seen = operation_ct.clone();
+        let response = runtime
+            .run_call(
+                "list_events",
+                request_ct.clone(),
+                operation_ct,
+                async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    done(if seen.is_cancelled() {
+                        "cancelled"
+                    } else {
+                        "finished"
+                    })
+                },
+            )
+            .await;
+        let task_id = task_id(response);
+        request_ct.cancel();
+        let result = settled(&runtime, &task_id).await;
+        assert_eq!(result.task.status(), TaskStatus::Completed, "{result:?}");
+        let payload = serde_json::to_value(&result).unwrap();
+        assert_eq!(payload["result"]["content"][0]["text"], "finished");
+    }
+
+    /// A batch stopped between items by `tasks/cancel` settles `cancelled`,
+    /// and its status says how far it got.
+    #[tokio::test]
+    async fn a_batch_cancelled_between_items_settles_cancelled() {
+        let runtime = TaskRuntime::new(quick());
+        let operation_ct = runtime.operation_token();
+        let watched = operation_ct.clone();
+        let response = runtime
+            .run_call(
+                "batch_delete",
+                CancellationToken::new(),
+                operation_ct,
+                async move {
+                    let total = 1_000;
+                    for done in 0..total {
+                        if stop_requested(&watched) {
+                            report_status(format!("Stopped after {done} of {total}"));
+                            break;
+                        }
+                        report_progress(done + 1, total);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    done_batch()
+                },
+            )
+            .await;
+        let task_id = task_id(response);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        runtime.cancel(&task_id).unwrap();
+        let result = settled(&runtime, &task_id).await;
+        assert_eq!(result.task.status(), TaskStatus::Cancelled, "{result:?}");
+        assert!(
+            result
+                .task
+                .task
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Stopped after")),
+            "{result:?}"
         );
     }
 
-    #[tokio::test]
-    async fn unknown_task_lookups_error() {
-        let mgr = TaskManager::new();
-        assert!(mgr.task_info("nope").is_err());
-        assert!(mgr.completion("nope").is_err());
+    fn done_batch() -> Result<CallToolResponse, McpError> {
+        done("batch")
     }
 
-    // ── Panic containment ────────────────────────────────────────────────
+    /// A single EventKit call cannot stop part-way: a cancel that arrives
+    /// while it runs leaves it `completed`.
+    #[tokio::test]
+    async fn a_call_that_cannot_stop_completes_despite_a_cancel() {
+        let runtime = TaskRuntime::new(quick());
+        let response = runtime
+            .run_call(
+                "request_access",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    done("granted")
+                },
+            )
+            .await;
+        let task_id = task_id(response);
+        runtime.cancel(&task_id).unwrap();
+        let result = settled(&runtime, &task_id).await;
+        assert_eq!(result.task.status(), TaskStatus::Completed, "{result:?}");
+    }
 
-    /// Spawn a worker that panics, with a guard watching it, and wait for it
-    /// to die — mirroring `enqueue_task`'s worker minus the tool call.
-    async fn spawn_panicking_worker(
-        mgr: &Arc<parking_lot::Mutex<TaskManager>>,
-        id: &str,
-        completion: Arc<TaskCompletion>,
-    ) {
-        let guard = TaskFailureGuard::new(id.to_string(), completion, Arc::clone(mgr));
-        let handle = tokio::spawn(async move {
-            let _guard = guard;
-            panic!("objc2: unexpected NULL returned from -[EKEventStore ...]");
+    /// A panic fails the task instead of stranding it `working` (the 0.6.x
+    /// bug: a panicking tool held its slot until the process exited).
+    #[tokio::test]
+    async fn a_panicking_operation_fails_its_task() {
+        let runtime = TaskRuntime::new(quick());
+        let response = runtime
+            .run_call(
+                "search",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async {
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    panic!("boom");
+                },
+            )
+            .await;
+        let task_id = task_id(response);
+        let result = settled(&runtime, &task_id).await;
+        assert_eq!(result.task.status(), TaskStatus::Failed, "{result:?}");
+        assert_eq!(runtime.manager.running_task_count(), 0, "no slot is held");
+    }
+
+    /// Admission is a ceiling: past it, a slow call finishes as a request.
+    #[tokio::test]
+    async fn a_call_past_admission_finishes_as_a_request() {
+        let runtime = TaskRuntime::new(TaskConfig {
+            max_active: 0,
+            ..quick()
         });
+        let response = runtime
+            .run_call(
+                "list_reminders",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async {
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    done("inline")
+                },
+            )
+            .await;
+        assert!(matches!(response, Ok(CallToolResponse::Complete(_))));
+    }
+
+    /// Closing the connection stops running tasks and drops them.
+    #[tokio::test]
+    async fn shutdown_stops_running_tasks() {
+        let runtime = TaskRuntime::new(TaskConfig {
+            shutdown_grace: Duration::from_millis(100),
+            ..quick()
+        });
+        let operation_ct = runtime.operation_token();
+        let watched = operation_ct.clone();
+        let response = runtime
+            .run_call(
+                "batch_move",
+                CancellationToken::new(),
+                operation_ct,
+                async move {
+                    watched.cancelled().await;
+                    done("stopped")
+                },
+            )
+            .await;
+        let task_id = task_id(response);
+        runtime.shutdown().await;
+        assert_eq!(runtime.manager.running_task_count(), 0);
+        assert!(runtime.get(&task_id).is_err());
+    }
+
+    /// An operation still between two checks when the grace runs out is not
+    /// cut there: it is detached, finishes the item it is on, and stops.
+    #[tokio::test]
+    async fn shutdown_lets_an_operation_reach_its_next_check() {
+        let runtime = TaskRuntime::new(TaskConfig {
+            shutdown_grace: Duration::from_millis(100),
+            ..quick()
+        });
+        let item_done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&item_done);
+        let response = runtime
+            .run_call(
+                "batch_move",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async move {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    flag.store(true, Ordering::SeqCst);
+                    done("stopped after the item")
+                },
+            )
+            .await;
+        task_id(response);
+        runtime.shutdown().await;
+        assert!(!item_done.load(Ordering::SeqCst), "the grace ended first");
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
-            handle.await.is_err(),
-            "the worker must actually have panicked"
+            item_done.load(Ordering::SeqCst),
+            "the item was finished, not cut"
         );
     }
 
-    /// THE wedge guard. Without [`TaskFailureGuard`], a panicking worker never
-    /// reaches its `transition`, so the task stays `Working` forever: TTL
-    /// pruning skips it and it holds an active slot permanently. After
-    /// `MAX_ACTIVE_TASKS` panics, `admit` refuses every future task for the life
-    /// of the process — background work is dead until the app restarts.
-    ///
-    /// This is the test that fails if someone removes the guard.
+    /// rmcp's TTL aborts a task that runs past it, and cancels the
+    /// operation's token first: a synchronous batch, which the abort cannot
+    /// reach, then stops between items.
     #[tokio::test]
-    async fn panicking_workers_do_not_wedge_admission() {
-        let mgr = Arc::new(parking_lot::Mutex::new(TaskManager::new()));
-        for i in 0..MAX_ACTIVE_TASKS {
-            let id = format!("p{i}");
-            let completion = Arc::new(TaskCompletion::new());
-            mgr.lock().insert(
-                id.clone(),
-                ManagedTask::running(
-                    Task::new(
-                        id.clone(),
-                        TaskStatus::Working,
-                        now_iso8601(),
-                        now_iso8601(),
-                    ),
-                    Arc::clone(&completion),
-                    CancellationToken::new(),
-                    tokio::spawn(async {}),
-                ),
-            );
-            spawn_panicking_worker(&mgr, &id, completion).await;
+    async fn the_ttl_cancels_the_operations_token() {
+        let runtime = TaskRuntime::new(TaskConfig {
+            ttl: Duration::from_millis(150),
+            ..quick()
+        });
+        let operation_ct = runtime.operation_token();
+        let token = operation_ct.clone();
+        let response = runtime
+            .run_call(
+                "batch_delete",
+                CancellationToken::new(),
+                operation_ct,
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    done("too late")
+                },
+            )
+            .await;
+        let task_id = task_id(response);
+        // Polling is what runs rmcp's TTL sweep; the aborted driver, and the
+        // operation with it, is dropped on the runtime's next turn after that.
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = runtime.get(&task_id);
+            if token.is_cancelled() {
+                break;
+            }
         }
-
-        let mut mgr = mgr.lock();
-        assert_eq!(
-            mgr.active_count(),
-            0,
-            "every panicked worker must have been marked terminal by its guard"
-        );
-        assert!(
-            mgr.admit().is_ok(),
-            "admission must still work after {MAX_ACTIVE_TASKS} panics"
-        );
-    }
-
-    /// A panicking worker must also unblock anyone waiting on `tasks/result`.
-    /// The result slot is filled by the worker, so an unwind would otherwise
-    /// leave a waiter parked on a slot nothing will ever fill.
-    #[tokio::test]
-    async fn a_panicking_worker_still_yields_a_result() {
-        let mgr = Arc::new(parking_lot::Mutex::new(TaskManager::new()));
-        let completion = Arc::new(TaskCompletion::new());
-        mgr.lock().insert(
-            "t".into(),
-            ManagedTask::running(
-                Task::new(
-                    "t".into(),
-                    TaskStatus::Working,
-                    now_iso8601(),
-                    now_iso8601(),
-                ),
-                Arc::clone(&completion),
-                CancellationToken::new(),
-                tokio::spawn(async {}),
-            ),
-        );
-
-        spawn_panicking_worker(&mgr, "t", Arc::clone(&completion)).await;
-
-        let result = completion
-            .wait(&CancellationToken::new())
-            .await
-            .expect("a panicked task must still produce a result");
-        assert_eq!(result.is_error, Some(true), "and it must be an error");
-        assert_eq!(
-            mgr.lock().task_info("t").expect("task exists").status,
-            TaskStatus::Failed
-        );
-    }
-
-    /// The guard must not overwrite a cancellation that already landed —
-    /// `complete` is first-write-wins, and the task is already terminal.
-    #[tokio::test]
-    async fn the_guard_does_not_clobber_an_earlier_cancellation() {
-        let mgr = Arc::new(parking_lot::Mutex::new(TaskManager::new()));
-        let completion = Arc::new(TaskCompletion::new());
-        mgr.lock().insert(
-            "t".into(),
-            ManagedTask::running(
-                Task::new(
-                    "t".into(),
-                    TaskStatus::Working,
-                    now_iso8601(),
-                    now_iso8601(),
-                ),
-                Arc::clone(&completion),
-                CancellationToken::new(),
-                tokio::spawn(async {}),
-            ),
-        );
-        mgr.lock().cancel_task("t").expect("cancel succeeds");
-
-        spawn_panicking_worker(&mgr, "t", Arc::clone(&completion)).await;
-
-        assert_eq!(
-            mgr.lock().task_info("t").expect("task exists").status,
-            TaskStatus::Cancelled,
-            "a late panic must NOT downgrade Cancelled to Failed"
-        );
+        assert!(token.is_cancelled(), "the TTL cancelled the token");
     }
 }

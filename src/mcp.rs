@@ -6,23 +6,43 @@
 //! This module is gated behind the `mcp` feature flag.
 
 // `RoleServer` / `service::RequestContext` are NOT imported: since rmcp-macros
-// 2.x (#866) the `#[prompt_handler]` / `#[tool_handler]` expansions name those
-// types with fully qualified paths, so they no longer have to be in scope.
+// 2.x (#866) the `#[tool_handler]` expansion names those types with fully
+// qualified paths, and the hand-written handlers below do the same.
 use rmcp::{
     ErrorData as McpError, ServiceExt, handler::server::wrapper::Parameters, model::*, prompt,
-    prompt_handler, prompt_router, schemars, schemars::JsonSchema, tool, tool_handler, tool_router,
+    prompt_router, schemars, schemars::JsonSchema, tool, tool_handler, tool_router,
     transport::stdio,
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "mcp_changes.rs"]
+mod changes;
+#[path = "mcp_thread.rs"]
+mod eventkit_thread;
+#[path = "mcp_resources.rs"]
+mod resources;
 #[path = "mcp_tasks.rs"]
 mod tasks;
-use tasks::{ManagedTask, TaskCompletion, TaskFailureGuard, TaskManager};
 
 use crate::{AuthorizationStatus, EventsManager, RemindersManager};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone};
 
 use rmcp::handler::server::wrapper::Json;
+use tokio_util::sync::CancellationToken;
+
+/// The newest MCP revision this server speaks. A 2025-era client still opens
+/// with `initialize`, answered in [`ProtocolVersion::LATEST_WITH_INITIALIZE`]
+/// (2025-11-25); a 2026-07-28 client runs that revision's stateless lifecycle,
+/// carrying its version, identity and capabilities in every request's `_meta`.
+/// Named rather than taken from rmcp's `LATEST`, so a newer SDK does not move
+/// the protocol on its own.
+const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+
+/// What this server calls itself in its handshake: `name` is what a host may
+/// file it under, `title` what a person reads. EventKit, Apple's framework, is
+/// how it works rather than what it is.
+const SERVER_NAME: &str = "calendar";
+const SERVER_TITLE: &str = "Calendar & Reminders";
 
 // ============================================================================
 // Structured Output Types
@@ -1235,40 +1255,41 @@ pub struct CreateReminderPromptArgs {
 ///
 /// EventKit objects (`Retained<EKEventStore>` and its managers) are `!Send + !Sync`,
 /// but every handler in this module keeps those values stack-local and never holds
-/// one across an `.await`. That makes the generated handler futures `Send`, so the
-/// server can run on a normal multi-thread tokio runtime without rmcp's `local`
-/// feature. New handlers MUST preserve this invariant.
+/// one across an `.await`. That makes the generated handler futures `Send`, which
+/// `call_tool` and `get_prompt` need: they move each call onto the EventKit thread
+/// (`mcp_thread.rs`). New handlers MUST preserve this invariant.
 ///
-/// **Never reach for `tokio::task::spawn_blocking` to satisfy it.** Doing so
-/// looks right — the `!Send` value would live entirely inside the closure — but
-/// it is the one thing that breaks the store cache. Stores are cached PER
-/// THREAD (see `StoreCache` in `imp.rs`), so the process holds two
-/// `EKEventStore`s for every thread that has ever touched EventKit. The worker
-/// pool is fixed at roughly the core count, which keeps that total small; the
-/// blocking pool is not — tokio grows it to **512 threads** by default, which
-/// would mean up to 1024 stores. EventKit refuses long before that:
+/// That thread is what keeps the process to one `EKEventStore`. Stores are
+/// cached PER THREAD (see `StoreCache` in `imp.rs`), so every thread that
+/// touches EventKit builds its own, and EventKit refuses a process that holds
+/// too many:
 ///
 /// ```text
 /// EKCADErrorDomain 1021: "This process has too many EKEventStore instances.
 ///                         Use fewer event stores."
 /// ```
 ///
-/// That error is exactly the outage the per-thread cache was introduced to fix
-/// (a fresh store per tool call), and routing EventKit work onto the blocking
-/// pool would reintroduce it at a worse scale.
-///
-/// So: keep EventKit calls synchronous and on the handler's own thread. If a
-/// handler is slow enough to need backgrounding, use the MCP task surface
-/// (`execution(task_support = "optional")` + `enqueue_task`), which moves the
-/// work to another *worker* thread rather than an unbounded blocking one.
+/// A fresh store per tool call caused that first, and 0.6.0 cached them. A
+/// store per tokio worker caused it again, two per worker, until every call
+/// moved to one thread. So keep EventKit calls synchronous and inside the
+/// handler, and **never** move them to another thread: not
+/// `tokio::task::spawn_blocking` (a pool of up to 512 threads), not
+/// `std::thread::spawn`, not a runtime of their own. Slow handlers included:
+/// a slow call that becomes an MCP task (SEP-2663, see the `tasks` module)
+/// keeps its bookkeeping on rmcp's runtime, but its tool still runs on the
+/// EventKit thread, spawned there by the task runtime. If a handler has to
+/// show it is alive, it reports between EventKit calls, holding no EventKit
+/// value across an `.await`.
 #[derive(Clone)]
+// Constructed only through `new()` / `Default`, so state can be added without a
+// breaking change.
+#[non_exhaustive]
 pub struct EventKitServer {
-    /// Background tasks this server owns (SEP-1686).
-    ///
-    /// `Arc<Mutex<..>>` keeps `EventKitServer: Send + Sync + Clone`, which the
-    /// `!Send` invariant above depends on — the manager never holds an
-    /// EventKit object, only ids, statuses and join handles.
-    task_manager: std::sync::Arc<parking_lot::Mutex<TaskManager>>,
+    /// This connection's tasks (SEP-2663).
+    tasks: std::sync::Arc<tasks::TaskRuntime>,
+    /// This connection's resource subscriptions, when it speaks 2025-11-25
+    /// (`mcp_changes.rs`); a 2026-07-28 client's live in its listen.
+    changes: std::sync::Arc<changes::Connection>,
 }
 
 impl Default for EventKitServer {
@@ -1305,8 +1326,13 @@ fn parse_datetime(s: &str) -> Result<DateTime<Local>, String> {
 #[allow(non_snake_case)]
 impl EventKitServer {
     pub fn new() -> Self {
+        Self::with_tasks(tasks::TaskConfig::DEFAULT)
+    }
+
+    fn with_tasks(config: tasks::TaskConfig) -> Self {
         Self {
-            task_manager: std::sync::Arc::new(parking_lot::Mutex::new(TaskManager::new())),
+            tasks: std::sync::Arc::new(tasks::TaskRuntime::new(config)),
+            changes: std::sync::Arc::default(),
         }
     }
 
@@ -1398,8 +1424,7 @@ impl EventKitServer {
             title = "List Reminders",
             read_only_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn list_reminders(
         &self,
@@ -1962,8 +1987,7 @@ impl EventKitServer {
 
     #[tool(
         description = "List calendar events. By default shows today's events. Can specify a date range.",
-        annotations(title = "List Events", read_only_hint = true, open_world_hint = false),
-        execution(task_support = "optional")
+        annotations(title = "List Events", read_only_hint = true, open_world_hint = false)
     )]
     async fn list_events(
         &self,
@@ -2337,8 +2361,7 @@ impl EventKitServer {
 
     #[tool(
         description = "Search reminders or events by text in title or notes (case-insensitive). Specify item_type to filter, or omit to search both.",
-        annotations(title = "Search", read_only_hint = true, open_world_hint = false),
-        execution(task_support = "optional")
+        annotations(title = "Search", read_only_hint = true, open_world_hint = false)
     )]
     async fn search(
         &self,
@@ -2419,53 +2442,34 @@ impl EventKitServer {
             destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn batch_delete(
         &self,
+        ct: CancellationToken,
         Parameters(params): Parameters<BatchDeleteRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let mut succeeded = 0usize;
-        let mut errors = Vec::new();
-
-        match params.item_type {
+        let response = match params.item_type {
             ItemType::Reminder => {
                 let manager = RemindersManager::new();
-                for id in &params.item_ids {
-                    match manager.delete_reminder(id) {
-                        Ok(_) => succeeded += 1,
-                        Err(e) => errors.push(format!("{id}: {e}")),
-                    }
-                }
+                run_batch(&params.item_ids, &ct, |id| {
+                    manager
+                        .delete_reminder(id)
+                        .map(drop)
+                        .map_err(|e| item_error(id, e))
+                })
             }
             ItemType::Event => {
                 let manager = EventsManager::new();
-                for id in &params.item_ids {
-                    match manager.delete_event(id, params.affect_future) {
-                        Ok(_) => succeeded += 1,
-                        Err(e) => errors.push(format!("{id}: {e}")),
-                    }
-                }
+                run_batch(&params.item_ids, &ct, |id| {
+                    manager
+                        .delete_event(id, params.affect_future)
+                        .map(drop)
+                        .map_err(|e| item_error(id, e))
+                })
             }
-        }
-
-        let err_items: Vec<_> = errors
-            .into_iter()
-            .map(|e| {
-                let (id, msg) = e.split_once(": ").unwrap_or(("unknown", &e));
-                BatchItemError {
-                    item_id: id.to_string(),
-                    message: msg.to_string(),
-                }
-            })
-            .collect();
-        Ok(Json(BatchResponse {
-            total: params.item_ids.len(),
-            succeeded,
-            failed: err_items.len(),
-            errors: err_items,
-        }))
+        };
+        Ok(Json(response))
     }
 
     #[tool(
@@ -2476,46 +2480,24 @@ impl EventKitServer {
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn batch_move(
         &self,
+        ct: CancellationToken,
         Parameters(params): Parameters<BatchMoveRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
         let manager = RemindersManager::new();
-        let mut succeeded = 0usize;
-        let mut errors = Vec::new();
-
-        for id in &params.reminder_ids {
-            match manager.update_reminder(
-                id,
-                &crate::ReminderPatch {
-                    calendar_title: Some(&params.destination_list_name),
-                    ..Default::default()
-                },
-            ) {
-                Ok(_) => succeeded += 1,
-                Err(e) => errors.push(format!("{id}: {e}")),
-            }
-        }
-
-        let err_items: Vec<_> = errors
-            .into_iter()
-            .map(|e| {
-                let (id, msg) = e.split_once(": ").unwrap_or(("unknown", &e));
-                BatchItemError {
-                    item_id: id.to_string(),
-                    message: msg.to_string(),
-                }
-            })
-            .collect();
-        Ok(Json(BatchResponse {
-            total: params.reminder_ids.len(),
-            succeeded,
-            failed: err_items.len(),
-            errors: err_items,
-        }))
+        let patch = crate::ReminderPatch {
+            calendar_title: Some(&params.destination_list_name),
+            ..Default::default()
+        };
+        Ok(Json(run_batch(&params.reminder_ids, &ct, |id| {
+            manager
+                .update_reminder(id, &patch)
+                .map(drop)
+                .map_err(|e| item_error(id, e))
+        })))
     }
 
     #[tool(
@@ -2526,86 +2508,104 @@ impl EventKitServer {
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
-        ),
-        execution(task_support = "optional")
+        )
     )]
     async fn batch_update(
         &self,
+        ct: CancellationToken,
         Parameters(params): Parameters<BatchUpdateRequest>,
     ) -> Result<Json<BatchResponse>, McpError> {
-        let mut succeeded = 0usize;
-        let mut errors = Vec::new();
-
-        match params.item_type {
+        let response = match params.item_type {
             ItemType::Reminder => {
                 let manager = RemindersManager::new();
-                for item in &params.updates {
+                run_batch(&params.updates, &ct, |item| {
                     let priority = item.priority.as_ref().map(Priority::to_usize);
                     let due_date = match &item.due_date {
                         Some(s) if s.is_empty() => Some(None),
-                        Some(s) => match parse_datetime_or_time(s) {
-                            Ok(dt) => Some(Some(dt)),
-                            Err(e) => {
-                                errors.push(format!("{}: {e}", item.item_id));
-                                continue;
-                            }
-                        },
+                        Some(s) => Some(Some(
+                            parse_datetime_or_time(s).map_err(|e| item_error(&item.item_id, e))?,
+                        )),
                         None => None,
                     };
-                    match manager.update_reminder(
-                        &item.item_id,
-                        &crate::ReminderPatch {
-                            title: item.title.as_deref(),
-                            notes: item.notes.as_deref(),
-                            completed: item.completed,
-                            priority,
-                            due_date,
-                            ..Default::default()
-                        },
-                    ) {
-                        Ok(_) => succeeded += 1,
-                        Err(e) => errors.push(format!("{}: {e}", item.item_id)),
-                    }
-                }
+                    manager
+                        .update_reminder(
+                            &item.item_id,
+                            &crate::ReminderPatch {
+                                title: item.title.as_deref(),
+                                notes: item.notes.as_deref(),
+                                completed: item.completed,
+                                priority,
+                                due_date,
+                                ..Default::default()
+                            },
+                        )
+                        .map(drop)
+                        .map_err(|e| item_error(&item.item_id, e))
+                })
             }
             ItemType::Event => {
                 let manager = EventsManager::new();
-                for item in &params.updates {
-                    match manager.update_event(
-                        &item.item_id,
-                        &crate::EventPatch {
-                            title: item.title.as_deref(),
-                            notes: item
-                                .notes
-                                .as_ref()
-                                .map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
-                            ..Default::default()
-                        },
-                    ) {
-                        Ok(_) => succeeded += 1,
-                        Err(e) => errors.push(format!("{}: {e}", item.item_id)),
-                    }
-                }
+                run_batch(&params.updates, &ct, |item| {
+                    manager
+                        .update_event(
+                            &item.item_id,
+                            &crate::EventPatch {
+                                title: item.title.as_deref(),
+                                notes: item
+                                    .notes
+                                    .as_ref()
+                                    .map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
+                                ..Default::default()
+                            },
+                        )
+                        .map(drop)
+                        .map_err(|e| item_error(&item.item_id, e))
+                })
             }
-        }
+        };
+        Ok(Json(response))
+    }
+}
 
-        let total = params.updates.len();
-        let err_items: Vec<_> = errors
-            .into_iter()
-            .map(|e| {
-                let (id, msg) = e.split_once(": ").unwrap_or(("unknown", &e));
-                BatchItemError {
-                    item_id: id.to_string(),
-                    message: msg.to_string(),
-                }
-            })
-            .collect();
-        Ok(Json(BatchResponse {
-            total,
-            succeeded,
-            failed: err_items.len(),
-            errors: err_items,
-        }))
+/// Apply one change per item, stopping between items when the call is
+/// cancelled (`tasks/cancel`, `notifications/cancelled`, or the connection
+/// closing). An EventKit call cannot be interrupted part-way, so between items
+/// is where a batch can stop. Once the call is a task, its status says how far
+/// the batch got.
+fn run_batch<T>(
+    items: &[T],
+    ct: &CancellationToken,
+    mut apply: impl FnMut(&T) -> Result<(), BatchItemError>,
+) -> BatchResponse {
+    let total = items.len();
+    let mut succeeded = 0usize;
+    let mut errors = Vec::new();
+    for (done, item) in items.iter().enumerate() {
+        if tasks::stop_requested(ct) {
+            tasks::report_status(format!(
+                "Stopped after {done} of {total}: {succeeded} succeeded, {} failed",
+                errors.len()
+            ));
+            break;
+        }
+        match apply(item) {
+            Ok(()) => succeeded += 1,
+            Err(error) => errors.push(error),
+        }
+        tasks::report_progress(done + 1, total);
+    }
+    BatchResponse {
+        total,
+        succeeded,
+        failed: errors.len(),
+        errors,
+    }
+}
+
+fn item_error(item_id: &str, error: impl std::fmt::Display) -> BatchItemError {
+    BatchItemError {
+        item_id: item_id.to_string(),
+        message: error.to_string(),
     }
 }
 
@@ -2964,184 +2964,333 @@ impl EventKitServer {
     }
 }
 
-// Implement the server handler
-#[tool_handler]
-#[prompt_handler]
-impl rmcp::ServerHandler for EventKitServer {
-    // ── MCP tasks (SEP-1686) ────────────────────────────────────────────
-    //
-    // Some EventKit work is slow enough that a host may time the call out: a
-    // full-calendar scan, or a `batch_*` over hundreds of items. Tools that
-    // declare `execution(task_support = "optional")` can be invoked
-    // task-augmented — this returns a task id immediately and runs the work in
-    // the background.
-    //
-    // Unlike most MCP task servers, this one PUSHES: every status transition
-    // sends `notifications/tasks/status` to the caller, so a task-aware client
-    // never has to poll to discover the work finished.
+/// What a caller gets when its work panicked on the EventKit thread. An abort
+/// also lands here, but only once the caller is gone, so nobody reads it.
+fn failed_on_eventkit_thread(what: &str, error: &tokio::task::JoinError) -> McpError {
+    McpError::internal_error(
+        format!("the {what} failed on the EventKit thread: {error}"),
+        None,
+    )
+}
 
-    async fn enqueue_task(
+/// Whether this request's client speaks 2026-07-28, whose results each carry
+/// how long they stay fresh (`ttlMs`) and who may cache them (SEP-2549).
+fn supports_cache_hints(context: &rmcp::service::RequestContext<rmcp::RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+// Implement the server handler
+//
+// `#[tool_handler]` but NOT `#[prompt_handler]`: the prompt macro REPLACES a
+// hand-written `get_prompt` with its own (rmcp-macros 2.x and 3.x alike), which
+// runs the router on rmcp's request worker and would put a store on every
+// worker again. `#[tool_handler]` keeps a hand-written `call_tool`. So
+// `get_prompt` and `list_prompts` are written out below, and
+// `get_prompt_is_ours_not_the_macros` holds the line.
+#[tool_handler]
+impl rmcp::ServerHandler for EventKitServer {
+    // ── The EventKit thread ─────────────────────────────────────────────
+    //
+    // Every tool call and prompt runs on the one EventKit thread
+    // (`mcp_thread.rs`), so the process holds one EKEventStore. These replace
+    // what the macros would generate, which run the routers on whichever
+    // worker rmcp's request task landed on.
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let server = self.clone();
+        let response = eventkit_thread::run(async move {
+            let prompt = rmcp::handler::server::prompt::PromptContext::new(
+                &server,
+                request.name,
+                request.arguments,
+                context,
+            );
+            Self::prompt_router().get_prompt(prompt).await
+        })
+        .await
+        .unwrap_or_else(|e| Err(failed_on_eventkit_thread("prompt", &e)));
+        changes::note_access();
+        response
+    }
+
+    /// What `#[prompt_handler]` generates; listing touches no EventKit value,
+    /// so it stays on rmcp's worker.
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        let hints = supports_cache_hints(&context);
+        Ok(ListPromptsResult {
+            result_type: Some(ResultType::COMPLETE),
+            prompts: Self::prompt_router().list_all(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: hints.then_some(0),
+            cache_scope: hints.then_some(CacheScope::Public),
+        })
+    }
+
+    // ── Resources (`mcp_resources.rs`) ──────────────────────────────────
+    //
+    // Calendars and reminders as read-only resources. Listing a calendar and
+    // every read touch the store, so both run on the EventKit thread; the
+    // templates are compiled in and do not.
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let listed = eventkit_thread::run(async { resources::listed() })
+            .await
+            .map_err(|e| failed_on_eventkit_thread("resource list", &e))?;
+        let hints = supports_cache_hints(&context);
+        Ok(ListResourcesResult {
+            result_type: Some(ResultType::COMPLETE),
+            resources: listed,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: hints.then_some(resources::FRESH_MS),
+            // Calendar and list names are the person's own.
+            cache_scope: hints.then_some(CacheScope::Private),
+        })
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let hints = supports_cache_hints(&context);
+        Ok(ListResourceTemplatesResult {
+            result_type: Some(ResultType::COMPLETE),
+            resource_templates: resources::templates(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: hints.then_some(resources::TEMPLATES_FRESH_MS),
+            cache_scope: hints.then_some(CacheScope::Public),
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let target = resources::Target::parse(&request.uri, resources::start_of_today())?;
+        let uri = request.uri;
+        let read = eventkit_thread::run(async move { resources::read(&target, &uri) })
+            .await
+            .unwrap_or_else(|e| Err(failed_on_eventkit_thread("resource read", &e)));
+        changes::note_access();
+        let mut result = read?;
+        if supports_cache_hints(&context) {
+            result = result
+                .with_ttl_ms(resources::FRESH_MS)
+                .with_cache_scope(CacheScope::Private);
+        }
+        Ok(result.into())
+    }
+
+    // ── Change notifications (`mcp_changes.rs`) ─────────────────────────
+    //
+    // A 2025-11-25 client subscribes URI by URI and hears every list change
+    // through its peer; a 2026-07-28 client holds `subscriptions/listen` open.
+    // Either way only what changed is sent, and a watch never asks for access.
+
+    /// A 2025-11-25 client has initialized: from now on it hears each change
+    /// to the resource list, and to each resource it subscribes to.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
+        self.changes.start(context.peer);
+    }
+
+    // rmcp marks the pair legacy-only, which they are: a 2026-07-28 client
+    // subscribes through `subscriptions/listen`, a 2025-11-25 one through these.
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        resources::Target::parse(&request.uri, resources::start_of_today())?;
+        self.changes.subscribe(request.uri).await;
+        Ok(())
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        self.changes.unsubscribe(&request.uri);
+        Ok(())
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(changes::accepted(requested))
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        tokio::select! {
+            () = context.cancelled() => {}
+            () = changes::listen(context.sink().clone()) => {}
+        }
+        Ok(())
+    }
+
+    /// A call to one of the task tools from a client that declared the tasks
+    /// extension may become a task once it has run for a second (see the
+    /// `tasks` module). Either way the tool runs on the EventKit thread: a
+    /// plain call through `eventkit_thread::run`, a promotable one through the
+    /// task runtime, which spawns it there with its `ToolRun` in scope.
+    async fn call_tool(
         &self,
         request: CallToolRequestParams,
         mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CreateTaskResult, McpError> {
-        // Hold the manager lock across BOTH admission and insertion, below.
-        // The worker's only interactions with the manager — its own transition
-        // and its failure guard's — take this same lock, so neither can run
-        // before the task is registered. Without that ordering, a worker that
-        // panicked in the window between `spawn` and `insert` would transition
-        // a task that did not exist yet, and the entry inserted a moment later
-        // would sit in `Working` forever. Holding one lock also closes the gap
-        // where two concurrent enqueues both passed `admit`.
-        let mut tasks = self.task_manager.lock();
-        tasks.admit()?;
-
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let now = tasks::now_iso8601();
-        let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
-            .with_poll_interval(1000);
-
-        let completion = std::sync::Arc::new(TaskCompletion::new());
-        let worker_completion = std::sync::Arc::clone(&completion);
-
-        // A child token so `tasks/cancel` can stop the work WITHOUT severing
-        // the transport cancellation this request already inherited.
-        let task_cancel = context.ct.child_token();
-        context.ct = task_cancel.clone();
-
+    ) -> Result<CallToolResponse, McpError> {
+        let tasks_declared = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        if !(tasks_declared && tasks::TASK_TOOLS.contains(&request.name.as_ref())) {
+            let server = self.clone();
+            let response = eventkit_thread::run(async move {
+                let call =
+                    rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
+                Self::tool_router().call(call).await
+            })
+            .await
+            .unwrap_or_else(|e| Err(failed_on_eventkit_thread("tool call", &e)));
+            changes::note_access();
+            return response;
+        }
+        let operation_ct = self.tasks.operation_token();
+        let request_ct = std::mem::replace(&mut context.ct, operation_ct.clone());
+        let tool = request.name.clone();
         let server = self.clone();
-        let peer = context.peer.clone();
-        let manager = std::sync::Arc::clone(&self.task_manager);
-        let worker_id = task_id.clone();
-
-        let guard = TaskFailureGuard::new(
-            worker_id.clone(),
-            std::sync::Arc::clone(&completion),
-            std::sync::Arc::clone(&manager),
-        );
-
-        let handle = tokio::spawn(async move {
-            // Armed until this worker reports for itself. `call_tool` can panic
-            // — objc2's non-null accessors abort on NULL, and several
-            // conversions unwrap on user data — and nothing here catches an
-            // unwind, so without the guard the task would never leave `Working`
-            // and its active slot would never be reclaimed.
-            let guard = guard;
-
-            let result = server.call_tool(request, context).await;
-            let failed = result.as_ref().map_or(true, |r| r.is_error == Some(true));
-            worker_completion.complete(result);
-
-            // Record the transition and push it. `transition` returns Some only
-            // on a REAL change, so a task cancelled a moment ago (already
-            // terminal) produces no second notification here.
-            let terminal = if failed {
-                TaskStatus::Failed
-            } else {
-                TaskStatus::Completed
-            };
-            let changed = manager.lock().transition(&worker_id, terminal);
-            guard.disarm();
-            if let Some(task) = changed {
-                let notification = ServerNotification::TaskStatusNotification(
-                    TaskStatusNotification::new(TaskStatusNotificationParam::new(task)),
-                );
-                // Fire-and-forget: a dead client must not be an error path.
-                if let Err(e) = peer.send_notification(notification).await {
-                    tracing::debug!(
-                        target: "eventkit",
-                        task = %worker_id,
-                        "tasks/status push failed — client gone: {e}"
-                    );
-                }
-            }
-        });
-
-        tasks.insert(
-            task_id,
-            ManagedTask::running(task.clone(), completion, task_cancel, handle),
-        );
-        drop(tasks);
-
-        Ok(CreateTaskResult::new(task))
+        self.tasks
+            .run_call(&tool, request_ct, operation_ct, async move {
+                let call =
+                    rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
+                let response = Self::tool_router().call(call).await;
+                changes::note_access();
+                response
+            })
+            .await
     }
 
-    async fn list_tasks(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<ListTasksResult, McpError> {
-        Ok(ListTasksResult::new(self.task_manager.lock().list_page()))
-    }
-
-    async fn get_task_info(
+    async fn get_task(
         &self,
         request: GetTaskParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        let task = self.task_manager.lock().task_info(&request.task_id)?;
-        Ok(GetTaskResult::new(task))
+        self.tasks.get(&request.task_id)
     }
 
-    async fn get_task_result(
+    async fn update_task(
         &self,
-        request: GetTaskPayloadParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<GetTaskPayloadResult, McpError> {
-        // Take the Arc, then DROP the manager lock before awaiting — holding a
-        // sync mutex across an await would block every other task operation for
-        // as long as this one waits.
-        let completion = self.task_manager.lock().completion(&request.task_id)?;
-        let result = completion.wait(&context.ct).await?;
-        let value = serde_json::to_value(result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(GetTaskPayloadResult::new(value))
+        request: UpdateTaskParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.update(&request.task_id, request.input_responses)
     }
 
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CancelTaskResult, McpError> {
-        // The lock is released at the end of this statement, BEFORE the abort
-        // below — see `TaskManager::cancel_task` for why that ordering matters.
-        let (task, aborted) = self.task_manager.lock().cancel_task(&request.task_id)?;
-        if let Some(handle) = aborted {
-            handle.abort();
-        }
-        // Push the cancellation too — a client awaiting this task should learn
-        // from the notification stream, not only from the reply to its own call.
-        let notification = ServerNotification::TaskStatusNotification(TaskStatusNotification::new(
-            TaskStatusNotificationParam::new(task.clone()),
-        ));
-        let _ = context.peer.send_notification(notification).await;
-        Ok(CancelTaskResult::new(task))
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel(&request.task_id)
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::builder()
+    /// Every revision up to `MAX_PROTOCOL_VERSION` and nothing newer, so a
+    /// newer rmcp cannot widen what this server claims. This one list bounds
+    /// `server/discover`, the `initialize` negotiation and the version a
+    /// request names in its own `_meta`.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION))
+    }
+
+    /// `server/discover` opens the 2026-07-28 lifecycle, so it is answered
+    /// only at a revision without a handshake. A probe at a 2025 version is
+    /// told the method does not exist, which is how a 2025-11-25 server
+    /// answers it: rmcp's default would answer and let the client run the
+    /// stateless lifecycle at a revision that defines none. (A version this
+    /// server does not speak at all never gets here: rmcp refuses it with
+    /// `-32022` first.)
+    ///
+    /// `supportedVersions` lists every revision this server implements, the
+    /// same list a `-32022` carries: a client must be able to read the two
+    /// answers as one fact (the official suite's `sep-2575` checks hold
+    /// them to it).
+    async fn discover(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        if context
+            .meta
+            .protocol_version()
+            .is_none_or(|version| version.has_initialize())
+        {
+            return Err(McpError::method_not_found::<DiscoverRequestMethod>());
+        }
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        // `tasks` is the SEP-2663 extension, offered on both revisions: only a
+        // slow call from a client that declared it ever becomes a task. The
+        // SEP-1686 `capabilities.tasks` slot retired in 0.7.0 stays gone.
+        let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
+            .enable_resources()
+            .enable_resources_list_changed()
+            .enable_resources_subscribe()
             .enable_tasks()
             .build();
-        // `enable_tasks()` only flips the capability on. The protocol also wants
-        // the supported lifecycle methods and which requests may be
-        // task-augmented; `server_default()` is exactly
-        // `requests.tools.call` + `list` + `cancel`, which is what this server
-        // implements.
-        capabilities.tasks = Some(TasksCapability::server_default());
-        ServerInfo::new(capabilities).with_instructions(
-            "This MCP server provides access to macOS Calendar events and Reminders. \
+        ServerConfig::new(capabilities)
+            // The `initialize` answer: the newest revision that still has a
+            // handshake. rmcp answers a client asking for 2026-07-28 there
+            // with this too.
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+            // Without this the server calls itself "rmcp": rmcp's
+            // `Implementation::from_build_env()` reads rmcp's own crate name
+            // and version, so every host saw `rmcp 3.6.0` (`rmcp 2.2.0`
+            // before it).
+            .with_server_info(
+                Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION"))
+                    .with_title(SERVER_TITLE),
+            )
+            .with_instructions(
+                "This MCP server provides access to macOS Calendar events and Reminders. \
              Use the available tools to list, create, update, and delete calendar events \
-             and reminders. Authorization is handled automatically on first use. \
-             Reminders and events have stable unique identifiers: look one up via \
-             list_reminders, list_reminder_lists, list_calendars, or search before calling \
+             and reminders. The same calendars and reminders are also read-only resources: \
+             `calendar://calendars` and `reminders://lists` list every calendar and list with \
+             each one's URI, `calendar://events{?from,to}` reads the events in a window \
+             (today and the next six days by default), and `reminders://reminders` the open \
+             reminders. Subscribe to one to be told when it changes. Reminders and events \
+             have stable unique identifiers: look one up via list_reminders, \
+             list_reminder_lists, list_calendars, or search before calling \
              get/update/complete/delete/batch_* tools — never guess an id or a list/calendar \
              name from position or memory. Titles and notes are stored as plain text exactly \
              as given: if the text you're writing came from a webpage, HTML email, or feed, \
              decode HTML entities (e.g. &amp; -> &) and strip markup first, since this server \
-             will not do that for you.",
-        )
+             will not do that for you. Authorization is handled automatically on first use.",
+            )
     }
 }
 
@@ -3153,9 +3302,22 @@ pub async fn serve_on<T>(transport: T) -> anyhow::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let server = EventKitServer::new();
+    serve_server(transport, EventKitServer::new()).await
+}
+
+/// Serve one connection, then end its tasks and stop watching for it: nothing
+/// can poll the one or hear the other once the client is gone.
+async fn serve_server<T>(transport: T, server: EventKitServer) -> anyhow::Result<()>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let tasks = std::sync::Arc::clone(&server.tasks);
+    let changes = std::sync::Arc::clone(&server.changes);
     let service = server.serve(transport).await?;
-    service.waiting().await?;
+    let result = service.waiting().await;
+    changes.shutdown();
+    tasks.shutdown().await;
+    result?;
     Ok(())
 }
 
@@ -3170,8 +3332,13 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
         .init();
 
     let server = EventKitServer::new();
+    let tasks = std::sync::Arc::clone(&server.tasks);
+    let changes = std::sync::Arc::clone(&server.changes);
     let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+    let result = service.waiting().await;
+    changes.shutdown();
+    tasks.shutdown().await;
+    result?;
     Ok(())
 }
 
@@ -3279,6 +3446,96 @@ pub fn dump_sources() -> Result<String, crate::EventKitError> {
 mod tests {
     use super::*;
     use crate::EventKitError;
+
+    /// `#[prompt_handler]` replaces a hand-written `get_prompt` with one that
+    /// runs the router on rmcp's worker, so an impl carrying it would make
+    /// every prompt (each builds a `RemindersManager`) open a store on
+    /// whichever worker served it — the `EKCADErrorDomain 1021` outage again,
+    /// with nothing failing to compile. The attribute must stay off the
+    /// handler, and `get_prompt` must keep routing onto the EventKit thread.
+    #[test]
+    fn get_prompt_is_ours_not_the_macros() {
+        let source = include_str!("mcp.rs");
+        let handler = source
+            .find("impl rmcp::ServerHandler for EventKitServer")
+            .expect("the handler impl");
+        let preamble = &source[source[..handler].rfind("\n}\n").unwrap_or(0)..handler];
+        let attributes: Vec<&str> = preamble
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("#["))
+            .collect();
+        assert!(
+            attributes.contains(&"#[tool_handler]"),
+            "the guard looks at the handler's own attributes: {attributes:?}"
+        );
+        assert!(
+            !attributes.iter().any(|a| a.contains("prompt_handler")),
+            "#[prompt_handler] would replace the hand-written get_prompt: {attributes:?}"
+        );
+        let body = &source[handler..];
+        let get_prompt = body
+            .find("async fn get_prompt(")
+            .expect("a hand-written get_prompt");
+        let next_fn = body[get_prompt + 1..]
+            .find("async fn ")
+            .map_or(body.len(), |i| get_prompt + 1 + i);
+        assert!(
+            body[get_prompt..next_fn].contains("eventkit_thread::run"),
+            "get_prompt must run the prompt router on the EventKit thread"
+        );
+    }
+
+    /// Listing calendars and reading a resource both build a manager, so both
+    /// run on the EventKit thread like every tool and prompt: on rmcp's worker
+    /// they would open a store per worker, the `EKCADErrorDomain 1021` outage
+    /// again, with nothing failing to compile.
+    #[test]
+    fn resources_touch_the_store_only_on_the_eventkit_thread() {
+        let source = include_str!("mcp.rs");
+        let handler = source
+            .find("impl rmcp::ServerHandler for EventKitServer")
+            .expect("the handler impl");
+        let body = &source[handler..];
+        for name in ["list_resources", "read_resource"] {
+            let start = body
+                .find(&format!("async fn {name}("))
+                .unwrap_or_else(|| panic!("a hand-written {name}"));
+            let end = body[start + 1..]
+                .find("async fn ")
+                .map_or(body.len(), |i| start + 1 + i);
+            assert!(
+                body[start..end].contains("eventkit_thread::run"),
+                "{name} must touch the store on the EventKit thread"
+            );
+        }
+    }
+
+    #[test]
+    fn the_server_calls_itself_calendar_and_offers_resources() {
+        use rmcp::ServerHandler as _;
+        let info = EventKitServer::new().get_info();
+        assert_eq!(info.server_info.name, "calendar");
+        assert_eq!(
+            info.server_info.title.as_deref(),
+            Some("Calendar & Reminders")
+        );
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        let resources = info
+            .capabilities
+            .resources
+            .expect("resources are advertised");
+        assert_eq!(
+            resources.subscribe,
+            Some(true),
+            "a resource can be subscribed to"
+        );
+        assert_eq!(
+            resources.list_changed,
+            Some(true),
+            "a change to the list is announced"
+        );
+    }
 
     #[test]
     fn parse_availability_accepts_every_variant() {

@@ -48,8 +48,8 @@ impl McpClient {
         // `BufRead::read_line` cannot honour a deadline: it blocks until a line
         // arrives, so a timeout checked around it only fires if the server is
         // still TALKING. When the server goes SILENT — a wedged worker thread,
-        // a task that panicked and never reported — the read never returns and
-        // the deadline is never reached. That turned a 10s assertion into an
+        // a handler that never answers — the read never returns and the
+        // deadline is never reached. That turned a 10s assertion into an
         // opaque 60s harness kill with no message. `recv_timeout` on this side
         // makes every timeout in this file real.
         let (tx, lines) = std::sync::mpsc::channel();
@@ -126,21 +126,6 @@ impl McpClient {
         self.recv_response(id, Duration::from_secs(10))
     }
 
-    /// Read lines until a NOTIFICATION with `method` arrives, or timeout.
-    /// Responses seen along the way are discarded.
-    fn wait_for_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let line = self.next_line(deadline)?;
-            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
-                continue;
-            };
-            if v.get("id").is_none() && v.get("method").and_then(Value::as_str) == Some(method) {
-                return Some(v);
-            }
-        }
-    }
-
     fn list_tools(&mut self) -> Vec<Value> {
         self.next_id += 1;
         let id = self.next_id;
@@ -198,17 +183,6 @@ fn mcp_auth_status_tool_is_registered() {
         names.contains(&"auth_status"),
         "auth_status not in tools/list. Got: {names:?}"
     );
-}
-
-/// Whether the SPAWNED SERVER has full Reminders access, asked over the
-/// protocol via `auth_status` (read-only, never fires a TCC dialog).
-///
-/// Reading `RemindersManager::authorization_status()` from the test process
-/// would answer the wrong question: TCC grants attach to a binary's identity,
-/// and the test binary is not the `eventkit` binary under test.
-fn server_has_full_access(c: &mut McpClient) -> bool {
-    let resp = c.call_tool("auth_status", json!({}));
-    resp["result"]["structuredContent"]["reminders"] == "FullAccess"
 }
 
 #[test]
@@ -392,142 +366,337 @@ fn mcp_every_tool_is_annotated_and_coherent() {
     );
 }
 
-/// The server must ADVERTISE tasks with the shape it actually implements.
-///
-/// `enable_tasks()` alone serializes an empty `tasks: {}`, which under-declares
-/// the surface — a client can't tell whether `tasks/list` or `tasks/cancel`
-/// exist. `TasksCapability::server_default()` declares
-/// `requests.tools.call` + `list` + `cancel`, which is exactly what this
-/// server implements.
+/// Tasks are the SEP-2663 extension (`capabilities.extensions`), never the
+/// SEP-1686 slot retired in 0.7.0, and no tool declares `execution`: the
+/// server decides which calls become tasks, the client does not ask per tool.
 #[test]
-fn mcp_advertises_the_task_capability_it_implements() {
+fn mcp_advertises_tasks_only_as_the_extension() {
     let mut c = McpClient::spawn();
     c.next_id += 1;
     let id = c.next_id;
     c.send(&json!({
         "jsonrpc": "2.0", "id": id, "method": "initialize",
         "params": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
         },
     }));
     let resp = c.recv_response(id, Duration::from_secs(5));
-    let tasks = &resp["result"]["capabilities"]["tasks"];
     assert!(
-        tasks.is_object(),
-        "tasks capability must be advertised: {resp}"
+        resp["result"]["capabilities"].is_object(),
+        "initialize must answer with capabilities: {resp}"
     );
     assert!(
-        tasks["requests"]["tools"]["call"].is_object(),
-        "task-augmented tools/call must be declared: {tasks}"
+        resp["result"]["capabilities"].get("tasks").is_none(),
+        "the v1 `tasks` slot must not be advertised: {resp}"
     );
     assert!(
-        tasks["list"].is_object(),
-        "tasks/list must be declared: {tasks}"
+        resp["result"]["capabilities"]["extensions"]
+            .as_object()
+            .is_some_and(|extensions| extensions.contains_key("io.modelcontextprotocol/tasks")),
+        "the tasks extension is offered: {resp}"
     );
-    assert!(
-        tasks["cancel"].is_object(),
-        "tasks/cancel must be declared: {tasks}"
-    );
-}
-
-/// Slow tools must declare `execution.taskSupport`, or a host has no way to
-/// know it may run them task-augmented and will keep timing them out.
-#[test]
-fn mcp_slow_tools_declare_task_support() {
-    let mut c = McpClient::spawn();
-    c.initialize();
     let tools = c.list_tools();
-    let capable: Vec<&str> = tools
+    let declared: Vec<&str> = tools
         .iter()
-        .filter(|t| !t["execution"]["taskSupport"].is_null())
+        .filter(|t| t.get("execution").is_some())
         .filter_map(|t| t["name"].as_str())
         .collect();
-    for expected in ["search", "batch_delete", "batch_move", "batch_update"] {
-        assert!(
-            capable.contains(&expected),
-            "`{expected}` is slow enough to need taskSupport; declared: {capable:?}"
-        );
-    }
+    assert!(
+        declared.is_empty(),
+        "no tool may declare `execution` (task support): {declared:?}"
+    );
 }
 
-/// End-to-end: a task-augmented call returns a task id, the task reaches a
-/// terminal state, `tasks/result` yields the payload — and the server PUSHES
-/// `notifications/tasks/status` rather than making the client poll.
-///
-/// The push is the part worth guarding. A task server that only answers polls
-/// is half a task server, and the notification is invisible to any test that
-/// just calls `tasks/get` in a loop.
+/// The SEP-1686 `task` parameter asks for nothing any more: SEP-2663 leaves
+/// the decision to the server, only for a client that declared the extension
+/// (this one did not), and `auth_status` is not a task tool anyway. So the
+/// call RUNS as a plain call. `auth_status` needs no EventKit access, so the
+/// run is a plain RESULT.
 #[test]
-fn mcp_task_roundtrip_emits_status_notification() {
+fn mcp_runs_a_task_augmented_call_as_a_plain_call() {
     let mut c = McpClient::spawn();
     c.initialize();
-
-    // Skip unless the SERVER has full access.
-    //
-    // This used to claim it worked on an unauthorized host too — "the tool
-    // fails inside the worker, the task goes to failed, and the push still
-    // fires". That was wrong, and it is what wedged CI: with the status
-    // `NotDetermined`, `search` does not fail, it calls `request_access` and
-    // parks the worker on the TCC consent dialog. A headless runner can never
-    // dismiss that dialog, so the worker never reported, no status was ever
-    // pushed, and the test sat until the harness killed it.
-    //
-    // The authorization state must be read from the SERVER, not from this test
-    // process: TCC identity is per-binary, so the test binary's own grant says
-    // nothing about the spawned `eventkit --mcp`.
-    if !server_has_full_access(&mut c) {
-        eprintln!("SKIP: the eventkit server lacks Full Access on this host");
-        return;
-    }
-
-    // MUST be a tool that DECLARES taskSupport — rmcp rejects task-augmenting
-    // one that doesn't ("Tool does not support task-based invocation"), which
-    // is the correct advertised==invokable behaviour. `search` is declared.
-    let created = c.request(
+    let resp = c.request(
         "tools/call",
         json!({
-            "name": "search",
-            "arguments": {"query": "eventkit-task-smoke-probe"},
+            "name": "auth_status",
+            "arguments": {},
             "task": {}
         }),
     );
-    let task_id = created["result"]["task"]["taskId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a created task: {created}"))
-        .to_string();
+    assert!(
+        resp.get("error").is_none() && resp["result"]["content"].is_array(),
+        "a task-augmented call must run as a plain call: {resp}"
+    );
+    assert!(
+        resp["result"].get("task").is_none(),
+        "the answer is a CallToolResult, not a task handle: {resp}"
+    );
+}
+
+/// The `_meta` a 2026-07-28 client puts on every request: its version,
+/// identity and capabilities, since that revision has no handshake.
+fn stateless_meta(version: &str, capabilities: &Value) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": capabilities,
+    })
+}
+
+/// The probe a 2026-07-28 client opens with: `server/discover` carrying its
+/// version, identity and capabilities in `_meta`.
+fn discover_probe(version: &str) -> Value {
+    json!({ "_meta": stateless_meta(version, &json!({})) })
+}
+
+/// An `initialize` asking for 2026-07-28 is answered in 2025-11-25: that
+/// revision has no handshake, so the newest one with one is the answer.
+#[test]
+fn mcp_negotiates_a_2026_07_28_client_down_to_2025_11_25() {
+    let mut c = McpClient::spawn();
+    let resp = c.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        }),
+    );
+    assert_eq!(resp["result"]["protocolVersion"], "2025-11-25", "{resp}");
+}
+
+/// A 2026-07-28 probe opens that revision's lifecycle: `server/discover`
+/// answers with every revision this server implements (the list a `-32022`
+/// carries too), the tasks extension and this server's identity, and a
+/// request carrying its own
+/// `_meta`, with no `initialize` anywhere, is served in that revision's shape.
+#[test]
+fn mcp_server_discover_at_2026_07_28_opens_the_stateless_lifecycle() {
+    let mut c = McpClient::spawn();
+    let resp = c.request("server/discover", discover_probe("2026-07-28"));
+    let result = &resp["result"];
     assert_eq!(
-        created["result"]["task"]["status"], "working",
-        "a fresh task starts working: {created}"
+        result["supportedVersions"],
+        json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]),
+        "{resp}"
     );
-
-    // THE ASSERTION THAT MATTERS: the terminal transition arrives unprompted.
-    let note = c
-        .wait_for_notification("notifications/tasks/status", Duration::from_secs(10))
-        .expect("server must PUSH tasks/status on the terminal transition, not force a poll");
-    assert_eq!(note["params"]["taskId"], task_id.as_str());
-    let pushed = note["params"]["status"].as_str().unwrap_or("");
     assert!(
-        matches!(pushed, "completed" | "failed"),
-        "pushed status must be terminal, got {pushed:?}"
+        result["capabilities"]["extensions"]
+            .as_object()
+            .is_some_and(|extensions| extensions.contains_key("io.modelcontextprotocol/tasks")),
+        "{resp}"
     );
 
-    // And the result is retrievable afterwards.
-    let payload = c.request("tasks/result", json!({"taskId": task_id}));
+    let resp = c.request(
+        "tools/list",
+        json!({ "_meta": stateless_meta("2026-07-28", &json!({})) }),
+    );
     assert!(
-        payload.get("result").is_some(),
-        "tasks/result must yield the payload: {payload}"
+        resp["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "{resp}"
     );
+    assert_eq!(resp["result"]["resultType"], "complete", "{resp}");
+}
 
-    // tasks/list must include it.
-    let listed = c.request("tasks/list", json!({}));
-    let ids: Vec<&str> = listed["result"]["tasks"]
+/// A probe at a 2025 version is told the method does not exist, and the
+/// handshake still works on the same pipe: that is the fallback.
+#[test]
+fn mcp_server_discover_at_a_2025_version_is_method_not_found() {
+    let mut c = McpClient::spawn();
+    let resp = c.request("server/discover", discover_probe("2025-11-25"));
+    assert_eq!(resp["error"]["code"], -32601, "{resp}");
+
+    c.initialize();
+    assert!(
+        !c.list_tools().is_empty(),
+        "the fallback session serves tools"
+    );
+}
+
+/// A revision newer than 2026-07-28 is refused `-32022` with every version
+/// this server speaks.
+#[test]
+fn mcp_refuses_an_unknown_revision_with_the_supported_list() {
+    let mut c = McpClient::spawn();
+    let resp = c.request("server/discover", discover_probe("2099-01-01"));
+    assert_eq!(resp["error"]["code"], -32022, "{resp}");
+    assert_eq!(
+        resp["error"]["data"]["supported"],
+        json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+        ]),
+    );
+}
+
+/// `tasks/*` belongs to clients that declared the extension: a session that
+/// did not is refused `-32021`.
+#[test]
+fn mcp_refuses_tasks_methods_without_the_extension() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let resp = c.request("tasks/get", json!({ "taskId": "nope" }));
+    assert_eq!(resp["error"]["code"], -32021, "{resp}");
+}
+
+/// The handshake names the server, not the SDK: without its own server info
+/// it answered `rmcp` and rmcp's version.
+#[test]
+fn mcp_names_itself_calendar() {
+    let mut c = McpClient::spawn();
+    let resp = c.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        }),
+    );
+    let info = &resp["result"]["serverInfo"];
+    assert_eq!(info["name"], "calendar", "{resp}");
+    assert_eq!(info["title"], "Calendar & Reminders", "{resp}");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"), "{resp}");
+    let resources = &resp["result"]["capabilities"]["resources"];
+    assert_eq!(
+        resources["subscribe"], true,
+        "resources are subscribable: {resp}"
+    );
+    assert_eq!(
+        resources["listChanged"], true,
+        "list changes are announced: {resp}"
+    );
+}
+
+/// Calendars and reminders are resources, listed WITHOUT asking for access: a
+/// host lists them when it connects, which must never raise the consent
+/// dialog. The fixed four are there whatever this process has been granted;
+/// one per calendar and per list follow only where full access already is.
+#[test]
+fn mcp_lists_calendars_and_reminders_as_resources() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let resp = c.request("resources/list", json!({}));
+    let uris: Vec<&str> = resp["result"]["resources"]
         .as_array()
-        .map(|a| a.iter().filter_map(|t| t["taskId"].as_str()).collect())
-        .unwrap_or_default();
-    assert!(
-        ids.contains(&task_id.as_str()),
-        "tasks/list must include it: {listed}"
+        .unwrap_or_else(|| panic!("a resources array: {resp}"))
+        .iter()
+        .filter_map(|r| r["uri"].as_str())
+        .collect();
+    for fixed in [
+        "calendar://calendars",
+        "calendar://events",
+        "reminders://lists",
+        "reminders://reminders",
+    ] {
+        assert!(uris.contains(&fixed), "{fixed} is listed: {uris:?}");
+    }
+
+    let resp = c.request("resources/templates/list", json!({}));
+    let templates: Vec<&str> = resp["result"]["resourceTemplates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a resourceTemplates array: {resp}"))
+        .iter()
+        .filter_map(|t| t["uriTemplate"].as_str())
+        .collect();
+    assert_eq!(
+        templates,
+        [
+            "calendar://events{?from,to}",
+            "calendar://calendars/{calendarId}/events{?from,to}",
+            "calendar://events/{eventId}",
+            "reminders://lists/{listId}{?completed}",
+            "reminders://reminders/{reminderId}",
+        ]
+    );
+}
+
+/// A URI naming nothing here is `-32002`, a bad parameter `-32602`: both are
+/// answered before anything touches the store, so neither needs access.
+#[test]
+fn mcp_refuses_unknown_and_malformed_resource_uris() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let resp = c.request("resources/read", json!({"uri": "calendar://nope"}));
+    assert_eq!(resp["error"]["code"], -32002, "{resp}");
+    let resp = c.request(
+        "resources/read",
+        json!({"uri": "calendar://events?from=tomorrow"}),
+    );
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+}
+
+/// A 2025-11-25 client subscribes URI by URI: to a resource here, and not to
+/// one this server does not have. Subscribing never asks for access, so this
+/// runs the same with or without it.
+#[test]
+fn mcp_subscribes_to_resources_here_and_nowhere_else() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let resp = c.request(
+        "resources/subscribe",
+        json!({"uri": "calendar://calendars"}),
+    );
+    assert!(resp["result"].is_object(), "{resp}");
+    let resp = c.request("resources/subscribe", json!({"uri": "bridge://calendars"}));
+    assert_eq!(resp["error"]["code"], -32002, "{resp}");
+    let resp = c.request(
+        "resources/unsubscribe",
+        json!({"uri": "calendar://calendars"}),
+    );
+    assert!(resp["result"].is_object(), "{resp}");
+}
+
+/// A 2026-07-28 client listens instead: the acknowledgment carries what this
+/// server serves of the filter asked for, which is resource list changes and
+/// its own URIs. Its tools and prompts never change, and the email URI is
+/// another server's.
+#[test]
+fn mcp_acknowledges_a_listen_with_what_it_serves() {
+    let mut c = McpClient::spawn();
+    c.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "subscriptions/listen",
+        "params": {
+            "notifications": {
+                "toolsListChanged": true,
+                "resourcesListChanged": true,
+                "resourceSubscriptions": ["calendar://calendars", "email://work/INBOX"],
+            },
+            "_meta": stateless_meta("2026-07-28", &json!({})),
+        },
+    }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ack = loop {
+        let line = c
+            .next_line(deadline)
+            .expect("an acknowledgment before the deadline");
+        let message: Value = serde_json::from_str(line.trim()).expect("JSON");
+        assert!(message.get("error").is_none(), "refused: {message}");
+        if message["method"] == "notifications/subscriptions/acknowledged" {
+            break message;
+        }
+    };
+    assert_eq!(
+        ack["params"]["notifications"],
+        json!({
+            "resourcesListChanged": true,
+            "resourceSubscriptions": ["calendar://calendars"],
+        }),
+        "{ack}"
     );
 }

@@ -1,6 +1,8 @@
 ---
 created: 2026-05-29T04:27
-updated: 2026-08-04T00:00
+updated: 2026-10-16T00:00
+updated: 2026-10-13T00:00
+updated: 2026-10-14T00:00
 ---
 # Changelog
 
@@ -11,6 +13,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The server names itself** — `serverInfo` was rmcp's own (`rmcp 3.6.0`,
+  `rmcp 2.2.0` before), since `get_info` never set it and
+  `Implementation::from_build_env()` reads rmcp's crate. It is now `calendar`,
+  titled "Calendar & Reminders", at this crate's version.
+- **EventKit store exhaustion, again** — 0.6.0 cached the store per thread, and the MCP server ran its tools on every tokio worker, with two stores each (reminders and events): twenty on a ten-core Mac, each a connection to the calendar daemon, and every authorization change reset them all. Agent Muse's beta was refused twice (2026-10-14 and 2026-10-15) with `EKCADErrorDomain 1021 — "This process has too many EKEventStore instances. Use fewer event stores."`
+  - Every tool call and prompt now runs on one dedicated thread (`mcp_thread.rs`, named `eventkit`), so the server holds one store however many connections or workers its host has. rmcp's service loop stays on the host's runtime, so a call that waits on the consent dialog no longer gets a host's liveness pings timed out.
+  - Reminders and events share that one store, as Apple's single instance does. The cache remembers each kind's authorization status, and a change in either resets the store.
+  - A store EventKit refuses is dropped, and the next call builds a new one. It used to stay cached and fail every call on its thread until a restart.
+  - Prompts too. `#[prompt_handler]` replaces a hand-written `get_prompt` with its own (rmcp-macros 2.x and 3.x alike), so the first cut's thread-routed `get_prompt` never ran: every prompt, each of which builds a `RemindersManager`, still opened a store on whichever worker served it. The handler now writes `get_prompt` and `list_prompts` itself, and `get_prompt_is_ours_not_the_macros` keeps the attribute off.
+### Added
+- **Calendars and reminders as resources** (`src/mcp_resources.rs`), read-only
+  JSON with the tools' own fields plus each listed item's `uri`:
+  `calendar://calendars`, `calendar://events{?from,to}`,
+  `calendar://calendars/{calendarId}/events{?from,to}`,
+  `calendar://events/{eventId}`, `reminders://lists`, `reminders://reminders`,
+  `reminders://lists/{listId}{?completed}` and
+  `reminders://reminders/{reminderId}`. A window defaults to today and the six
+  days after and spans at most a year; identifiers are one percent-encoded
+  segment. Listing never asks for access: the four fixed resources always, one
+  per calendar and per list only once full access is granted. A 2026-07-28
+  client is told a read and the list stay fresh for a minute (`Private`), the
+  templates an hour (`Public`). An unknown URI or id is `-32002`, a bad
+  parameter `-32602`. Listing and reading run on the EventKit thread.
+- `RemindersManager::fetch_list_reminders(list_id, include_completed)`: one
+  list's reminders by identifier (a title can name two lists), refusing an id
+  that is not a reminder list's.
+- **Change notifications for those resources** (`src/mcp_changes.rs`): the
+  server declares `resources.subscribe` and `listChanged`. One observer per
+  process counts `EKEventStoreChangedNotification`; each subscription keeps a
+  fingerprint of what it watches and, once a burst has settled for half a
+  second, re-reads it on the EventKit thread and sends only what changed:
+  `notifications/resources/updated` per URI, `list_changed` for the list. A
+  2025-11-25 client subscribes with `resources/subscribe` and hears list
+  changes once initialized; a 2026-07-28 client holds `subscriptions/listen`
+  open, accepted for list changes and this server's URIs. A watch also wakes
+  at local midnight (a default window moves on) and when a call has moved
+  access, and never asks for access itself.
+- **`eventkit --mcp` turns the main run loop.** EventKit posts store changes on
+  the main thread's run loop whatever thread made the store, so with the main
+  thread blocked in `block_on` none were ever heard. The server now runs on a
+  thread of its own and exits the process when it ends.
+- **MCP tasks, as the SEP-2663 extension** (`io.modelcontextprotocol/tasks`,
+  offered on both revisions), version 0.8.0 — a call to `list_reminders`,
+  `list_events`, `search`, `batch_delete`, `batch_move`, `batch_update`,
+  `request_access` or `get_current_location` from a client that declared the
+  extension becomes a task when it is still running after 1 second: the client
+  gets a task handle at once and polls `tasks/get`. Quick calls, and every call
+  from a client that did not declare the extension, are answered inline as
+  before. Up to 4 tasks run at once (each takes its turn on the one EventKit
+  thread, where every EventKit call runs) and 256 are held; a task lives
+  1 hour. A tool that panics fails its task instead of stranding it. Closing
+  the connection asks every task to stop; one still running after 2 seconds is
+  left to finish the item it is on and stop, never aborted mid-item. A task
+  past its hour is aborted, with its batch told to stop first.
+- **Batches stop between items when cancelled** — `batch_delete`,
+  `batch_move` and `batch_update` check for cancellation (`tasks/cancel`,
+  `notifications/cancelled`, or the connection closing) before each item. A
+  cancelled batch task is `cancelled`, with a status saying how far it got;
+  while it runs, its status and `_meta["io.agentmuse/progress"]` on `tasks/get`
+  report items done out of the total. A single EventKit call cannot stop
+  part-way: a task cancelled during one is `completed`.
+
+### Changed
+- **Rust 1.99 or newer** (`rust-version`), the toolchain Agent Muse builds with.
+- **`rmcp` 2.2.0 → 3.6.0**, exact-pinned to the embedding Agent Muse
+  workspace's copy, so the app links one rmcp.
+- **MCP 2026-07-28 alongside 2025-11-25** — a 2026-07-28 client runs that
+  revision's stateless lifecycle: `server/discover` answers with every
+  revision this server implements (the list a `-32022` carries too), every
+  request carries its own
+  version, identity and capabilities in `_meta`, and results carry
+  `resultType`. A 2025-era client still opens with `initialize`, answered in
+  2025-11-25 exactly as before, also when it asks for 2026-07-28.
+  `server/discover` at a 2025 version is method-not-found, so no client runs
+  the stateless lifecycle at a revision that defines none, and a revision
+  newer than 2026-07-28 is refused `-32022` with the list. The ceiling is named
+  (`MAX_PROTOCOL_VERSION`), never rmcp's `LATEST`.
+
+### Removed
+- **MCP tasks (SEP-1686), version 0.7.0** — the server no longer advertises
+  `capabilities.tasks`; `list_reminders`, `list_events`, `search`,
+  `batch_delete`, `batch_move` and `batch_update` no longer declare
+  `execution.taskSupport`; and `tasks/list`, `tasks/get`, `tasks/result` and
+  `tasks/cancel` are gone, with the `notifications/tasks/status` push and the
+  task manager behind them (`mcp_tasks.rs`). Agent Muse, which embeds this
+  server, measured the task surface unused (no task-augmented call, no
+  `tasks/*` request in two weeks of traffic), and every rmcp 3.x release
+  removes the MCP 2025-11-25 task model. A task-augmented `tools/call` runs as
+  a plain call, the spec's rule for a server without the capability. EventKit
+  calls stay synchronous on the
+  handler's own thread. The `tokio-util` and `uuid` dependencies went with
+  it. Tasks returned in 0.8.0 as the SEP-2663 extension (see Added), with
+  `tokio-util` for the operation tokens. A breaking change, hence the minor
+  version bump.
 ### Changed
 - **MCP server instructions** — `get_info()`'s `instructions` string now also tells clients to look up ids via `list_reminders`/`list_reminder_lists`/`list_calendars`/`search` rather than guessing them, and that titles/notes are stored as plain text verbatim (decode HTML entities and strip markup before writing content sourced from a webpage/email/feed — the server does not do this for you). This is the one piece of guidance every MCP-spec-compliant client sees automatically at connect time regardless of whether it also supports Skills.
 ### Fixed
