@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **MCP server instructions** — `get_info()`'s `instructions` string now also tells clients to look up ids via `list_reminders`/`list_reminder_lists`/`list_calendars`/`search` rather than guessing them, and that titles/notes are stored as plain text verbatim (decode HTML entities and strip markup before writing content sourced from a webpage/email/feed — the server does not do this for you). This is the one piece of guidance every MCP-spec-compliant client sees automatically at connect time regardless of whether it also supports Skills.
 ### Fixed
 - **`outputSchema` claimed fields the server didn't send** — `attachments_count`/`alarms`/`recurrence_rules` on reminders and events, `attendees` on events, `errors` on batch responses, and `supported_event_availabilities` on calendars all used `#[serde(skip_serializing_if = ...)]` without the matching `#[serde(default)]`. `schemars` only treats a field as optional in the generated schema when a `default` is present, so it kept marking these `required` even though serde omitted them whenever empty/zero. Any host that validates `structuredContent` strictly against `outputSchema` (e.g. Claude Desktop) rejected every `list_reminders`, `list_reminder_lists`, `search`, and `batch_*` call as malformed data as soon as one item lacked alarms/recurrence/attachments. Added `#[serde(default)]` alongside each `skip_serializing_if` so the declared schema matches actual output.
 
