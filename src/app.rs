@@ -410,18 +410,36 @@ enum DumpCommands {
 pub fn run() {
     let cli = Cli::parse();
 
-    // Handle --mcp flag
+    // Handle --mcp flag. The server runs on its own thread and the main thread
+    // turns its run loop: EventKit posts a store change on the main thread's
+    // run loop, so with the main thread blocked in `block_on` no observer ever
+    // hears one, and the server's change notifications never start (measured:
+    // a store on any thread is heard only while the main run loop turns).
     #[cfg(feature = "mcp")]
     if cli.mcp {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime");
-        if let Err(e) = rt.block_on(eventkit::mcp::run_mcp_server()) {
-            eprintln!("MCP server error: {}", e);
-            std::process::exit(1);
+        std::thread::spawn(move || {
+            let code = match rt.block_on(eventkit::mcp::run_mcp_server()) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("MCP server error: {}", e);
+                    1
+                }
+            };
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
+        });
+        let main_loop = objc2_foundation::NSRunLoop::mainRunLoop();
+        loop {
+            // `run` returns at once whenever the loop has nothing to wait on;
+            // turn it again after a pause rather than spin.
+            main_loop.run();
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        return;
     }
 
     let Some(command) = cli.command else {
