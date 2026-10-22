@@ -115,6 +115,7 @@ struct BatchResponse {
     succeeded: usize,
     #[schemars(with = "i64")]
     failed: usize,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<BatchItemError>,
 }
@@ -493,10 +494,13 @@ struct ReminderOutput {
     /// Parent reminder identifier when this is a subtask.
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_id: Option<String>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     attachments_count: usize,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     alarms: Vec<AlarmOutput>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recurrence_rules: Vec<RecurrenceRuleOutput>,
 }
@@ -585,10 +589,13 @@ struct EventOutput {
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     structured_location: Option<LocationOutput>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     alarms: Vec<AlarmOutput>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recurrence_rules: Vec<RecurrenceRuleOutput>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     attendees: Vec<AttendeeOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -606,6 +613,7 @@ struct EventOutput {
     /// the timezone applied to `start` / `end`.
     #[serde(skip_serializing_if = "Option::is_none")]
     timezone: Option<String>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     attachments_count: usize,
 }
@@ -696,6 +704,7 @@ struct CalendarOutput {
     /// subset of `["busy", "free", "tentative", "unavailable"]`. Empty
     /// when the calendar holds reminders only, or for source backends that
     /// report `EKCalendarEventAvailabilityNone`.
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     supported_event_availabilities: Vec<String>,
 }
@@ -3273,9 +3282,16 @@ impl rmcp::ServerHandler for EventKitServer {
              `calendar://calendars` and `reminders://lists` list every calendar and list with \
              each one's URI, `calendar://events{?from,to}` reads the events in a window \
              (today and the next six days by default), and `reminders://reminders` the open \
-             reminders. Subscribe to one to be told when it changes. Authorization is handled \
-             automatically on first use.",
+             reminders. Subscribe to one to be told when it changes. Reminders and events \
+             have stable unique identifiers: look one up via list_reminders, \
+             list_reminder_lists, list_calendars, or search before calling \
+             get/update/complete/delete/batch_* tools — never guess an id or a list/calendar \
+             name from position or memory. Titles and notes are stored as plain text exactly \
+             as given: if the text you're writing came from a webpage, HTML email, or feed, \
+             decode HTML entities (e.g. &amp; -> &) and strip markup first, since this server \
+             will not do that for you. Authorization is handled automatically on first use.",
             )
+
     }
 }
 
