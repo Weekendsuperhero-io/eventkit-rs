@@ -41,7 +41,7 @@ anyhow = { version = "1", optional = true }
 # Exact-pinned to the HERO workspace's rmcp, so the app links
 # one copy. The protocol does not move with the SDK: the server speaks up to
 # `mcp::MAX_PROTOCOL_VERSION` (2026-07-28), named in the source.
-rmcp = { version = "=3.7.0", features = [
+rmcp = { version = "=3.8.0", features = [
   # `macros` + `server` come from rmcp defaults; `transport-async-rw` is
   # transitively pulled by `transport-io`. Only `transport-io` is needed
   # to expose `rmcp::transport::stdio()` for the standalone `--mcp`
