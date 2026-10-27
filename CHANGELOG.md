@@ -1,8 +1,6 @@
 ---
 created: 2026-05-29T04:27
-updated: 2026-10-16T00:00
-updated: 2026-10-13T00:00
-updated: 2026-10-14T00:00
+updated: 2026-10-27T00:00
 ---
 # Changelog
 
@@ -12,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Changed
+- **Task progress under `com.makeyourhero/progress` too**, version 0.9.1 —
+  `tasks/get` reports a running task's progress under
+  `_meta["com.makeyourhero/progress"]` as well as
+  `_meta["io.agentmuse/progress"]`, the same `{"progress": n, "total": m}`
+  under each. The old key stays for hosts released before HERO, which read
+  only that one.
 
 ### Fixed
 - **The server names itself** — `serverInfo` was rmcp's own (`rmcp 3.6.0`,
