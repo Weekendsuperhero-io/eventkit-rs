@@ -8,9 +8,9 @@
 //! It used to hold a store for every tokio worker that had ever served a
 //! tool, and two of them (reminders and events), so twenty on a ten-core Mac.
 //! Each one is a connection to the calendar daemon, and every authorization
-//! change resets all of them. On 2026-10-14 and 2026-10-15 Agent Muse's beta
-//! was refused with `EKCADErrorDomain 1021`: *"This process has too many
-//! EKEventStore instances. Use fewer event stores."*
+//! change resets all of them. On 2026-10-14 and 2026-10-15 the embedding
+//! desktop app's beta was refused with `EKCADErrorDomain 1021`: *"This
+//! process has too many EKEventStore instances. Use fewer event stores."*
 //!
 //! The thread runs a current-thread tokio runtime. The MCP service loop is
 //! NOT on it: rmcp reads the transport and answers pings on the host's

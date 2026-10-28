@@ -35,7 +35,8 @@
 //!
 //! **Progress.** After promotion a batch reports how far it got as the task's
 //! status message, and `tasks/get` carries the numbers under
-//! [`PROGRESS_META_KEY`].
+//! [`PROGRESS_META_KEY`] and, for hosts released before HERO, under
+//! [`LEGACY_PROGRESS_META_KEY`] too.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -74,7 +75,11 @@ pub(super) const TASK_TOOLS: &[&str] = &[
 
 /// The `_meta` key under which `tasks/get` reports a running task's latest
 /// progress, as `{"progress": n, "total": m}`.
-pub(super) const PROGRESS_META_KEY: &str = "io.agentmuse/progress";
+pub(super) const PROGRESS_META_KEY: &str = "com.makeyourhero/progress";
+
+/// [`PROGRESS_META_KEY`] as hosts released before HERO spell it. They read
+/// only this key, so `tasks/get` writes the same value under both.
+pub(super) const LEGACY_PROGRESS_META_KEY: &str = "io.agentmuse/progress";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TaskConfig {
@@ -375,15 +380,15 @@ impl TaskRuntime {
             && tracked.len() < self.config.max_tracked
     }
 
-    /// `tasks/get`, with the latest progress under [`PROGRESS_META_KEY`].
+    /// `tasks/get`, with the latest progress under [`PROGRESS_META_KEY`] and
+    /// [`LEGACY_PROGRESS_META_KEY`].
     pub(super) fn get(&self, task_id: &str) -> Result<GetTaskResult, McpError> {
         let mut result = GetTaskResult::new(self.manager.get_task(task_id)?);
         if let Some((progress, total)) = self.progress.get(task_id) {
+            let value = serde_json::json!({ "progress": progress, "total": total });
             let mut meta = MetaObject::default();
-            meta.0.insert(
-                PROGRESS_META_KEY.to_string(),
-                serde_json::json!({ "progress": progress, "total": total }),
-            );
+            meta.0.insert(PROGRESS_META_KEY.to_string(), value.clone());
+            meta.0.insert(LEGACY_PROGRESS_META_KEY.to_string(), value);
             result.meta = Some(meta);
         }
         Ok(result)
@@ -672,6 +677,51 @@ mod tests {
 
     fn done_batch() -> Result<CallToolResponse, McpError> {
         done("batch")
+    }
+
+    /// `tasks/get` reports a running task's progress under both keys, the
+    /// same value under each: hosts released before HERO read only
+    /// `io.agentmuse/progress`. The keys are spelled out rather than taken
+    /// from the constants, so renaming either fails here, not at a host.
+    #[tokio::test]
+    async fn a_running_tasks_progress_is_under_both_keys() {
+        let runtime = TaskRuntime::new(quick());
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel::<()>();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        let response = runtime
+            .run_call(
+                "batch_update",
+                CancellationToken::new(),
+                runtime.operation_token(),
+                async move {
+                    // Only a task has progress to report: wait to be one.
+                    let _ = report_rx.await;
+                    report_progress(2, 5);
+                    let _ = finish_rx.await;
+                    done_batch()
+                },
+            )
+            .await;
+        let task_id = task_id(response);
+        report_tx.send(()).expect("the operation waits to report");
+        let mut reported = None;
+        for _ in 0..200 {
+            let result = runtime.get(&task_id).expect("task is held");
+            if result.meta.is_some() {
+                reported = Some(result);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let result = reported.expect("the task reported progress");
+        assert_eq!(result.task.status(), TaskStatus::Working, "{result:?}");
+        let payload = serde_json::to_value(&result).unwrap();
+        let meta = &payload["_meta"];
+        let progress = serde_json::json!({ "progress": 2, "total": 5 });
+        assert_eq!(meta["com.makeyourhero/progress"], progress, "{payload}");
+        assert_eq!(meta["io.agentmuse/progress"], progress, "{payload}");
+        finish_tx.send(()).expect("the operation waits to finish");
+        settled(&runtime, &task_id).await;
     }
 
     /// A single EventKit call cannot stop part-way: a cancel that arrives
