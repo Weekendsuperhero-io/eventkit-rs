@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absent, so the schemas it advertises read the same.
 - **parking_lot 0.13** (from 0.12), version 0.9.3 — no code change: the
   blocking bridges use only `Mutex`, `MutexGuard` and `Condvar`, which keep
-  their API. tokio's floor moves to 1.54.
+  their API. tokio's floor moves to 1.54, to match the HERO workspace.
 - **rmcp 3.8.0**, version 0.9.1 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. rmcp 3.8.0 reports a 429 or 5xx as
   `StreamableHttpError::HttpStatus` (with any `Retry-After`) and stops an SSE
