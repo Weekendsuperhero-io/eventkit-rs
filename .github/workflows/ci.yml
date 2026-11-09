@@ -18,7 +18,10 @@ jobs:
       # Parity with `./ci-check.sh` locally; honors the `live-eventkit`
       # serial group + slow-timeout settings. `#[ignore]`d live tests stay
       # skipped — they need real Calendar consent and can't run on a runner.
-      test-command: cargo install cargo-nextest --locked --quiet && cargo nextest run --all-features --profile ci
+      # A prebuilt cargo-nextest (install-nextest), not compiled each run.
+      # nextest skips doctests, so `cargo test --doc` runs them.
+      install-nextest: true
+      test-command: cargo nextest run --locked --all-features --profile ci && cargo test --doc --locked --all-features
       build-matrix-json: >-
         [
           {"os":"macos-26","target":"x86_64-apple-darwin"},
