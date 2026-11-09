@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive"] }
 # Lock pair for the blocking Obj-C completion-block bridges in `imp.rs`.
 # Non-poisoning (a panic in a completion block can't brick later lock()s) and
 # already in the tree via tokio, so this adds no new compile unit.
-parking_lot = "0.12"
+parking_lot = "0.13"
 thiserror = "2"
 
 # Optional cross-platform dependencies (gated behind features)
