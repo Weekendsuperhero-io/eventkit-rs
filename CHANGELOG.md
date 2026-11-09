@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T04:27
-updated: 2026-10-27T00:00
+updated: 2026-11-09T00:00
 ---
 # Changelog
 
@@ -12,6 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **rmcp 3.9.0**, version 0.9.3 — exact-pinned to the HERO workspace's rmcp,
+  so the app still links one copy. The bump clears RUSTSEC-2026-0462 for the
+  app: rmcp's streamable-HTTP client now bounds a non-streaming response body
+  (16 MiB for JSON, 64 KiB for an error) and answers a larger one with
+  `StreamableHttpError::ResponseBodyTooLarge`. This crate does not build
+  rmcp's HTTP client, so it was never exposed. The server side moves only where this
+  crate does not reach it: `skills/*` and `resources/directory/read` answer
+  `-32601` unless a server declares the skills extension, which this one does
+  not, and a tool's `outputSchema` now describes what `Serialize` writes
+  (rust-sdk#1378); every optional field of this server's outputs is skipped when
+  absent, so the schemas it advertises read the same.
+- **parking_lot 0.13** (from 0.12), version 0.9.3 — no code change: the
+  blocking bridges use only `Mutex`, `MutexGuard` and `Condvar`, which keep
+  their API. tokio's floor moves to 1.54, to match the HERO workspace.
 - **rmcp 3.8.0**, version 0.9.1 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. rmcp 3.8.0 reports a 429 or 5xx as
   `StreamableHttpError::HttpStatus` (with any `Retry-After`) and stops an SSE
