@@ -31,8 +31,9 @@ path = "src/main.rs"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 # Lock pair for the blocking Obj-C completion-block bridges in `imp.rs`.
-# Non-poisoning (a panic in a completion block can't brick later lock()s) and
-# already in the tree via tokio, so this adds no new compile unit.
+# Non-poisoning (a panic in a completion block can't brick later lock()s).
+# tokio 1.54 still depends on parking_lot 0.12, so with the `mcp` feature the
+# tree carries both 0.12 and 0.13 until tokio moves.
 parking_lot = "0.13"
 thiserror = "2"
 
