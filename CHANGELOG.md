@@ -1,6 +1,6 @@
 ---
 created: 2026-05-29T04:27
-updated: 2026-11-09T00:00
+updated: 2026-11-13T00:00
 ---
 # Changelog
 
@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **rmcp 3.10.0**, version 0.9.4 — exact-pinned to the HERO workspace's rmcp,
+  so the app still links one copy. Nothing this server sends changes: the
+  protocol types are byte-identical to 3.9.0's, and rmcp-macros 3.10.0
+  differs only in its documentation, so the macros expand as before and the
+  hand-written `get_prompt` still runs (`get_prompt_is_ours_not_the_macros`).
+  3.10.0's one behaviour change (rust-sdk#1428) is in the `x-mcp-header`
+  check its streamable-HTTP client runs on `tools/list`, which this crate
+  does not build, and its new `skills-fs` feature is not enabled.
 - **rmcp 3.9.0**, version 0.9.3 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. The bump clears RUSTSEC-2026-0462 for the
   app: rmcp's streamable-HTTP client now bounds a non-streaming response body
