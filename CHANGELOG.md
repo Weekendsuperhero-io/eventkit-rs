@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **rmcp 3.11.0**, version 0.9.5 — exact-pinned to the HERO workspace's rmcp,
+  so the app still links one copy. One answer changes: `completion/complete`
+  is `-32601` (method not found) where it was an empty list, because this
+  server declares no `completions` and rmcp now refuses a method for an
+  undeclared capability (rust-sdk#1446). HERO's bridge reads that as "no
+  suggestions". rmcp-macros 3.11.0 is 3.10.0's source under a new version,
+  so `#[prompt_handler]` expands as before.
 - **rmcp 3.10.0**, version 0.9.4 — exact-pinned to the HERO workspace's rmcp,
   so the app still links one copy. Nothing this server sends changes: the
   protocol types are byte-identical to 3.9.0's, and rmcp-macros 3.10.0
