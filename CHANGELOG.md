@@ -133,6 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`MAX_PROTOCOL_VERSION`), never rmcp's `LATEST`.
 
 ### Removed
+- **Review bot removed**: the PR review, PR description and changelog workflows called platform-tools' Jules bot, and Jules has shut down, so they are gone.
 - **MCP tasks (SEP-1686), version 0.7.0** — the server no longer advertises
   `capabilities.tasks`; `list_reminders`, `list_events`, `search`,
   `batch_delete`, `batch_move` and `batch_update` no longer declare
